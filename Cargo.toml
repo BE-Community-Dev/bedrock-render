@@ -1,0 +1,70 @@
+[package]
+name = "bedrock-render"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Tile renderer for Minecraft Bedrock worlds"
+repository = "https://github.com/BE-Community-Dev/bedrock-render"
+homepage = "https://github.com/BE-Community-Dev/bedrock-render"
+documentation = "https://docs.rs/bedrock-render"
+readme = "README.md"
+keywords = ["minecraft", "bedrock", "render", "map", "mcbe"]
+categories = ["rendering", "game-development", "multimedia::images"]
+publish = false
+include = [
+    "Cargo.toml",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "benches/**/*.rs",
+    "data/colors/*.json",
+    "data/colors/*.brpal",
+    "docs/**/*.md",
+    "docs/images/*.png",
+    "examples/**/*.rs",
+    "examples/web_map_assets/*",
+    "src/**/*.rs",
+    "tests/**/*.rs",
+]
+
+[lib]
+name = "bedrock_render"
+path = "src/bedrock_render.rs"
+
+[features]
+default = ["async", "webp", "gpu"]
+async = ["dep:tokio", "bedrock-world/async"]
+gpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+webp = ["image/webp"]
+png = ["image/png"]
+
+[dependencies]
+bedrock-world = { git = "https://github.com/BE-Community-Dev/bedrock-world.git", rev = "843ff81769cca36d7f55257afcf396332427e39f", default-features = true }
+bytemuck = { version = "1.25.0", features = ["derive"], optional = true }
+crossbeam-channel = "0.5.15"
+image = { version = "0.25.6", default-features = false }
+pollster = { version = "0.4.0", optional = true }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sysinfo = "0.38.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["rt", "sync"], optional = true }
+wgpu = { version = "29.0.1", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+indexmap = "2.12.1"
+
+[[bench]]
+name = "render"
+harness = false
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
