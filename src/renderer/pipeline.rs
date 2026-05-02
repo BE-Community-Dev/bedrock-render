@@ -38,6 +38,7 @@ const DEFAULT_EXPORT_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_INTERACTIVE_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const MIN_AUTO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_AUTO_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const SESSION_BATCH_CULL_FULL_INDEX_THRESHOLD_CHUNKS: usize = 4096;
 const MISSING_HEIGHT: i16 = i16::MIN;
 const GPU_COMPOSE_MIN_PIXELS: usize = 256 * 256;
 /// GPU terrain-lighting shader version used in cache signatures.
@@ -2207,6 +2208,9 @@ fn spawn_tile_cache_writer(cache: Arc<Mutex<TileCache>>) -> Option<TileCacheWrit
         .name("bedrock-render-tile-cache-writer".to_string())
         .spawn(move || {
             for write in receiver {
+                let tile_x = write.key.tile_x;
+                let tile_z = write.key.tile_z;
+                let dimension = write.key.dimension;
                 let cache = match cache.lock() {
                     Ok(cache) => cache,
                     Err(_) => {
@@ -2215,7 +2219,21 @@ fn spawn_tile_cache_writer(cache: Arc<Mutex<TileCache>>) -> Option<TileCacheWrit
                     }
                 };
                 if let Err(error) = cache.write_encoded(&write.key, &write.encoded) {
-                    log::warn!("failed to write rendered tile cache asynchronously: {error}");
+                    log::warn!(
+                        "tile cache write failed (dimension={:?}, tile=({}, {}), error={})",
+                        dimension,
+                        tile_x,
+                        tile_z,
+                        error
+                    );
+                } else {
+                    log::trace!(
+                        "tile cache write complete (dimension={:?}, tile=({}, {}), bytes={})",
+                        dimension,
+                        tile_x,
+                        tile_z,
+                        write.encoded.len()
+                    );
                 }
             }
         }) {
@@ -2229,8 +2247,18 @@ fn spawn_tile_cache_writer(cache: Arc<Mutex<TileCache>>) -> Option<TileCacheWrit
 
 fn queue_tile_cache_write(writer: &Option<TileCacheWriteSender>, write: TileCacheWrite) {
     let Some(writer) = writer else {
+        log::warn!(
+            "tile cache writer unavailable (dimension={:?}, tile=({}, {}))",
+            write.key.dimension,
+            write.key.tile_x,
+            write.key.tile_z
+        );
         return;
     };
+    let tile_x = write.key.tile_x;
+    let tile_z = write.key.tile_z;
+    let dimension = write.key.dimension;
+    let bytes = write.encoded.len();
     let sender = match writer.lock() {
         Ok(sender) => sender,
         Err(_) => {
@@ -2239,7 +2267,21 @@ fn queue_tile_cache_write(writer: &Option<TileCacheWriteSender>, write: TileCach
         }
     };
     if let Err(error) = sender.send(write) {
-        log::warn!("failed to queue rendered tile cache write: {error}");
+        log::warn!(
+            "failed to queue rendered tile cache write (dimension={:?}, tile=({}, {}), error={})",
+            dimension,
+            tile_x,
+            tile_z,
+            error
+        );
+    } else {
+        log::trace!(
+            "tile cache write queued (dimension={:?}, tile=({}, {}), bytes={})",
+            dimension,
+            tile_x,
+            tile_z,
+            bytes
+        );
     }
 }
 
@@ -2388,13 +2430,17 @@ impl MapRenderSession {
             ..RenderPipelineStats::default()
         };
         let mut render_tiles = Vec::new();
+        let stream_started = Instant::now();
+        let rendered_stream_count = Arc::new(AtomicUsize::new(0));
+        let mut failed_stream_count = 0usize;
 
         log::debug!(
-            "streaming web tiles (tiles={}, backend={:?}, cache_policy={:?}, cull_missing={})",
+            "streaming web tiles start (tiles={}, backend={:?}, cache_policy={:?}, cull_missing={}, priority={:?})",
             planned_tiles.len(),
             options.backend,
             options.cache_policy,
-            self.config.cull_missing_chunks
+            self.config.cull_missing_chunks,
+            options.priority
         );
 
         let ordered_tiles = prioritized_planned_tiles(planned_tiles, options.priority);
@@ -2412,6 +2458,13 @@ impl MapRenderSession {
                 if let Some(encoded) = cached {
                     cached_diagnostics.cache_hits = cached_diagnostics.cache_hits.saturating_add(1);
                     cached_stats.cache_hits = cached_stats.cache_hits.saturating_add(1);
+                    log::trace!(
+                        "tile cache hit (dimension={:?}, tile=({}, {}), bytes={})",
+                        planned.job.coord.dimension,
+                        planned.job.coord.x,
+                        planned.job.coord.z,
+                        encoded.len()
+                    );
                     sink.as_ref()(TileStreamEvent::Cached {
                         planned: planned.clone(),
                         encoded,
@@ -2422,16 +2475,34 @@ impl MapRenderSession {
 
             cached_diagnostics.cache_misses = cached_diagnostics.cache_misses.saturating_add(1);
             cached_stats.cache_misses = cached_stats.cache_misses.saturating_add(1);
-            let planned = self.prepare_planned_tile_for_render(planned, &options)?;
+            log::trace!(
+                "tile cache miss (dimension={:?}, tile=({}, {}))",
+                planned.job.coord.dimension,
+                planned.job.coord.x,
+                planned.job.coord.z
+            );
+            render_tiles.push(planned.clone());
+        }
+
+        let mut culled_render_tiles = Vec::new();
+        for planned in self.prepare_planned_tiles_for_render(&render_tiles, &options)? {
             if planned.chunk_positions.as_ref().is_some_and(Vec::is_empty) {
+                failed_stream_count = failed_stream_count.saturating_add(1);
+                log::debug!(
+                    "tile has no renderable chunks after cull (dimension={:?}, tile=({}, {}))",
+                    planned.job.coord.dimension,
+                    planned.job.coord.x,
+                    planned.job.coord.z
+                );
                 sink.as_ref()(TileStreamEvent::Failed {
                     planned,
                     error: "tile has no renderable chunks".to_string(),
                 })?;
-                continue;
+            } else {
+                culled_render_tiles.push(planned);
             }
-            render_tiles.push(planned);
         }
+        render_tiles = culled_render_tiles;
 
         let progress_sink = RenderProgressSink::new({
             let sink = Arc::clone(&sink);
@@ -2460,6 +2531,7 @@ impl MapRenderSession {
                 .then(|| spawn_tile_cache_writer(Arc::clone(&self.cache)))
                 .flatten();
             let sink = Arc::clone(&sink);
+            let rendered_stream_count_for_sink = Arc::clone(&rendered_stream_count);
             for render_group in render_tiles.chunks(render_group_size) {
                 let rendered = self.renderer.render_web_tiles_blocking(
                     render_group,
@@ -2473,6 +2545,16 @@ impl MapRenderSession {
                         } else {
                             None
                         };
+                        rendered_stream_count_for_sink.fetch_add(1, Ordering::Relaxed);
+                        log::trace!(
+                            "tile rendered (dimension={:?}, tile=({}, {}), width={}, height={}, encoded_bytes={})",
+                            planned.job.coord.dimension,
+                            planned.job.coord.x,
+                            planned.job.coord.z,
+                            tile.width,
+                            tile.height,
+                            tile.encoded.as_ref().map_or(0, Vec::len)
+                        );
                         sink.as_ref()(TileStreamEvent::Rendered { planned, tile })?;
                         if let Some(cache_write) = cache_write {
                             queue_tile_cache_write(&cache_writer, cache_write);
@@ -2488,6 +2570,14 @@ impl MapRenderSession {
                     Err(error) => {
                         let message = error.to_string();
                         for planned in render_group.iter().cloned() {
+                            failed_stream_count = failed_stream_count.saturating_add(1);
+                            log::warn!(
+                                "tile render failed (dimension={:?}, tile=({}, {}), error={})",
+                                planned.job.coord.dimension,
+                                planned.job.coord.x,
+                                planned.job.coord.z,
+                                message
+                            );
                             sink.as_ref()(TileStreamEvent::Failed {
                                 planned,
                                 error: message.clone(),
@@ -2504,6 +2594,18 @@ impl MapRenderSession {
             diagnostics: final_diagnostics,
             stats: final_stats,
         };
+        log::debug!(
+            "streaming web tiles complete (tiles={}, cached={}, cache_misses={}, rendered={}, failed={}, gpu_tiles={}, cpu_tiles={}, gpu_fallbacks={}, elapsed_ms={})",
+            planned_tiles.len(),
+            cached_stats.cache_hits,
+            cached_stats.cache_misses,
+            rendered_stream_count.load(Ordering::Relaxed),
+            failed_stream_count,
+            result.stats.gpu_tiles,
+            result.stats.cpu_tiles,
+            result.stats.gpu_fallbacks,
+            stream_started.elapsed().as_millis()
+        );
         sink.as_ref()(TileStreamEvent::Complete {
             diagnostics: result.diagnostics.clone(),
             stats: result.stats.clone(),
@@ -2581,41 +2683,137 @@ impl MapRenderSession {
         Ok(receiver)
     }
 
-    fn prepare_planned_tile_for_render(
+    fn prepare_planned_tiles_for_render(
         &self,
-        planned: &PlannedTile,
+        planned_tiles: &[PlannedTile],
         options: &RenderOptions,
-    ) -> Result<PlannedTile> {
-        if !self.config.cull_missing_chunks || planned.chunk_positions.is_some() {
-            return Ok(planned.clone());
+    ) -> Result<Vec<PlannedTile>> {
+        if planned_tiles.is_empty() || !self.config.cull_missing_chunks {
+            return Ok(planned_tiles.to_vec());
         }
-        let region = RenderChunkRegion {
-            dimension: planned.region.dimension,
-            min_chunk_x: planned.region.min_chunk_x,
-            min_chunk_z: planned.region.min_chunk_z,
-            max_chunk_x: planned.region.max_chunk_x,
-            max_chunk_z: planned.region.max_chunk_z,
-        };
-        let positions = self
-            .renderer
-            .world
-            .list_render_chunk_positions_in_region_blocking(
-                region,
-                WorldScanOptions {
-                    threading: WorldThreadingOptions::Single,
-                    ..WorldScanOptions::default()
-                },
-            )?;
-        log::trace!(
-            "culled planned tile ({}, {}) to {} render chunks",
-            planned.job.coord.x,
-            planned.job.coord.z,
-            positions.len()
+        if planned_tiles
+            .iter()
+            .all(|planned| planned.chunk_positions.is_some())
+        {
+            return Ok(planned_tiles.to_vec());
+        }
+
+        let started = Instant::now();
+        let renderable_chunks =
+            self.index_renderable_chunks_for_planned_tiles(planned_tiles, options)?;
+        let mut prepared = Vec::with_capacity(planned_tiles.len());
+        let mut total_selected_chunks = 0usize;
+        for planned in planned_tiles {
+            if planned.chunk_positions.is_some() {
+                prepared.push(planned.clone());
+                continue;
+            }
+            let positions = tile_chunk_positions(&planned.job)?
+                .into_iter()
+                .filter(|pos| renderable_chunks.contains(pos))
+                .collect::<Vec<_>>();
+            total_selected_chunks = total_selected_chunks.saturating_add(positions.len());
+            log::trace!(
+                "tile cull complete (dimension={:?}, tile=({}, {}), renderable_chunks={})",
+                planned.job.coord.dimension,
+                planned.job.coord.x,
+                planned.job.coord.z,
+                positions.len()
+            );
+            let mut planned = planned.clone();
+            planned.chunk_positions = Some(positions);
+            prepared.push(planned);
+            check_cancelled(options)?;
+        }
+        log::debug!(
+            "batch tile cull complete (tiles={}, renderable_chunks={}, selected_chunks={}, elapsed_ms={})",
+            planned_tiles.len(),
+            renderable_chunks.len(),
+            total_selected_chunks,
+            started.elapsed().as_millis()
         );
-        let mut planned = planned.clone();
-        planned.chunk_positions = Some(positions);
-        check_cancelled(options)?;
-        Ok(planned)
+        Ok(prepared)
+    }
+
+    fn index_renderable_chunks_for_planned_tiles(
+        &self,
+        planned_tiles: &[PlannedTile],
+        options: &RenderOptions,
+    ) -> Result<BTreeSet<ChunkPos>> {
+        let mut regions = BTreeMap::<Dimension, RenderChunkRegion>::new();
+        for planned in planned_tiles
+            .iter()
+            .filter(|planned| planned.chunk_positions.is_none())
+        {
+            let region = RenderChunkRegion {
+                dimension: planned.region.dimension,
+                min_chunk_x: planned.region.min_chunk_x,
+                min_chunk_z: planned.region.min_chunk_z,
+                max_chunk_x: planned.region.max_chunk_x,
+                max_chunk_z: planned.region.max_chunk_z,
+            };
+            regions
+                .entry(region.dimension)
+                .and_modify(|existing| merge_render_chunk_region(existing, region))
+                .or_insert(region);
+        }
+        if regions.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        let candidate_chunks = regions
+            .values()
+            .map(render_chunk_region_area)
+            .try_fold(0usize, |total, area| {
+                area.map(|area| total.saturating_add(area))
+            })?;
+        let threading = render_world_threading(options, candidate_chunks.max(planned_tiles.len()))?;
+        let scan_options = WorldScanOptions {
+            threading,
+            pipeline: options.cpu.to_world_pipeline(),
+            cancel: render_world_cancel(options),
+            ..WorldScanOptions::default()
+        };
+        let use_full_index = candidate_chunks > SESSION_BATCH_CULL_FULL_INDEX_THRESHOLD_CHUNKS;
+        log::debug!(
+            "batch tile cull index start (tiles={}, dimensions={}, candidate_chunks={}, strategy={}, workers={:?})",
+            planned_tiles.len(),
+            regions.len(),
+            candidate_chunks,
+            if use_full_index {
+                "full-index"
+            } else {
+                "region-index"
+            },
+            threading
+        );
+
+        let mut renderable_chunks = BTreeSet::new();
+        if use_full_index {
+            let all_positions = self
+                .renderer
+                .world
+                .list_render_chunk_positions_blocking(scan_options)?;
+            for pos in all_positions {
+                if regions
+                    .get(&pos.dimension)
+                    .is_some_and(|region| render_chunk_region_contains(*region, pos))
+                {
+                    renderable_chunks.insert(pos);
+                }
+            }
+        } else {
+            for region in regions.values().copied() {
+                for pos in self
+                    .renderer
+                    .world
+                    .list_render_chunk_positions_in_region_blocking(region, scan_options.clone())?
+                {
+                    renderable_chunks.insert(pos);
+                }
+            }
+        }
+        Ok(renderable_chunks)
     }
 
     fn cache_key_for_planned(&self, planned: &PlannedTile, format: ImageFormat) -> TileCacheKey {
@@ -5246,6 +5444,42 @@ fn render_world_cancel(options: &RenderOptions) -> Option<WorldCancelFlag> {
         .cancel
         .as_ref()
         .map(|cancel| WorldCancelFlag::from_shared(Arc::clone(&cancel.0)))
+}
+
+fn render_world_threading(
+    options: &RenderOptions,
+    work_items: usize,
+) -> Result<WorldThreadingOptions> {
+    let workers = options
+        .threading
+        .resolve_for_profile_checked(options.execution_profile, work_items.max(1))?;
+    Ok(if workers <= 1 {
+        WorldThreadingOptions::Single
+    } else {
+        WorldThreadingOptions::Fixed(workers)
+    })
+}
+
+fn merge_render_chunk_region(target: &mut RenderChunkRegion, other: RenderChunkRegion) {
+    target.min_chunk_x = target.min_chunk_x.min(other.min_chunk_x);
+    target.min_chunk_z = target.min_chunk_z.min(other.min_chunk_z);
+    target.max_chunk_x = target.max_chunk_x.max(other.max_chunk_x);
+    target.max_chunk_z = target.max_chunk_z.max(other.max_chunk_z);
+}
+
+fn render_chunk_region_area(region: &RenderChunkRegion) -> Result<usize> {
+    let x_count = i64::from(region.max_chunk_x) - i64::from(region.min_chunk_x) + 1;
+    let z_count = i64::from(region.max_chunk_z) - i64::from(region.min_chunk_z) + 1;
+    usize::try_from(x_count.saturating_mul(z_count))
+        .map_err(|_| BedrockRenderError::Validation("render cull region is too large".to_string()))
+}
+
+fn render_chunk_region_contains(region: RenderChunkRegion, pos: ChunkPos) -> bool {
+    pos.dimension == region.dimension
+        && pos.x >= region.min_chunk_x
+        && pos.x <= region.max_chunk_x
+        && pos.z >= region.min_chunk_z
+        && pos.z <= region.max_chunk_z
 }
 
 fn render_chunk_priority_for_region(
