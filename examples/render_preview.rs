@@ -1,7 +1,8 @@
 use bedrock_render::{
-    ChunkRegion, ChunkTileLayout, ImageFormat, MapRenderer, PlannedTile, RenderDiagnostics,
-    RenderDiagnosticsSink, RenderMode, RenderOptions, RenderPalette, RenderThreadingOptions,
-    RgbaColor, TilePathScheme,
+    BlockBoundaryRenderOptions, ChunkRegion, ChunkTileLayout, ImageFormat, MapRenderer,
+    PlannedTile, RenderDiagnostics, RenderDiagnosticsSink, RenderMode, RenderOptions,
+    RenderPalette, RenderThreadingOptions, RgbaColor, SurfaceRenderOptions, TerrainLightingOptions,
+    TilePathScheme,
 };
 use bedrock_world::{BedrockLevelDbStorage, BedrockWorld, Dimension, NbtTag, OpenOptions};
 use image::{ImageFormat as OutputImageFormat, save_buffer_with_format};
@@ -212,6 +213,7 @@ fn render_viewport(
             format: ImageFormat::Rgba,
             threading: RenderThreadingOptions::Auto,
             diagnostics: diagnostics_sink,
+            surface: preview_surface_options(),
             ..RenderOptions::default()
         },
     )?;
@@ -340,6 +342,27 @@ fn viewport_tiles(
             pixels_per_block: 1,
         },
     )
+}
+
+fn preview_surface_options() -> SurfaceRenderOptions {
+    let mut lighting = TerrainLightingOptions::strong();
+    lighting.normal_strength = 2.35;
+    lighting.shadow_strength = 0.68;
+    lighting.highlight_strength = 0.52;
+    lighting.edge_relief_strength = 0.34;
+    lighting.edge_relief_threshold = 2.0;
+    lighting.edge_relief_max_shadow = 22.0;
+    SurfaceRenderOptions {
+        height_shading: true,
+        lighting,
+        block_boundaries: BlockBoundaryRenderOptions {
+            strength: 0.42,
+            flat_strength: 0.16,
+            max_shadow: 18.0,
+            ..BlockBoundaryRenderOptions::default()
+        },
+        ..SurfaceRenderOptions::default()
+    }
 }
 
 fn save_web_tiles(

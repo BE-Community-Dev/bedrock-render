@@ -1,14 +1,12 @@
 use crate::{BedrockRenderError, Result};
+use bedrock_world::{BlockState, NbtTag};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Cursor, Read};
 use std::path::Path;
 
-const PALETTE_CACHE_MAGIC: &[u8; 8] = b"BRPAL01\0";
 const BUILTIN_BLOCK_COLOR_JSON: &str = include_str!("../../data/colors/bedrock-block-color.json");
 const BUILTIN_BIOME_COLOR_JSON: &str = include_str!("../../data/colors/bedrock-biome-color.json");
-const BUILTIN_PALETTE_CACHE_BYTES: &[u8] = include_bytes!("../../data/colors/bedrock-colors.brpal");
 
 /// An 8-bit RGBA color used by palettes and decoded render planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +59,8 @@ pub struct RenderPalette {
     biome_foliage_colors: HashMap<u32, RgbaColor>,
     biome_water_colors: HashMap<u32, RgbaColor>,
     block_colors: HashMap<String, RgbaColor>,
+    block_state_colors: HashMap<String, BlockStateColorRules>,
+    block_variant_colors: HashMap<String, HashMap<String, RgbaColor>>,
     unknown_biome_color: RgbaColor,
     unknown_block_color: RgbaColor,
     missing_chunk_color: RgbaColor,
@@ -77,38 +77,29 @@ pub struct RenderPalette {
     max_height_color: RgbaColor,
 }
 
+#[derive(Debug, Clone)]
+struct BlockStateColorRules {
+    rules: Vec<BlockStateColorRule>,
+}
+
+#[derive(Debug, Clone)]
+struct BlockStateColorRule {
+    state_name: String,
+    selector: StateColorSelector,
+    color: RgbaColor,
+}
+
+#[derive(Debug, Clone)]
+enum StateColorSelector {
+    IntRange { min: i32, max: i32 },
+    StringValues(Vec<String>),
+}
+
 impl Default for RenderPalette {
     fn default() -> Self {
-        let mut palette = Self {
-            biome_colors: HashMap::new(),
-            biome_grass_colors: HashMap::new(),
-            biome_foliage_colors: HashMap::new(),
-            biome_water_colors: HashMap::new(),
-            block_colors: HashMap::new(),
-            unknown_biome_color: RgbaColor::new(255, 0, 255, 180),
-            unknown_block_color: RgbaColor::new(255, 0, 255, 255),
-            missing_chunk_color: RgbaColor::new(0, 0, 0, 0),
-            void_color: RgbaColor::new(0, 0, 0, 0),
-            air_color: RgbaColor::new(0, 0, 0, 0),
-            default_grass_color: RgbaColor::new(142, 185, 113, 255),
-            default_foliage_color: RgbaColor::new(113, 167, 77, 255),
-            default_water_color: RgbaColor::new(63, 118, 228, 255),
-            cave_air_color: RgbaColor::new(12, 12, 14, 255),
-            cave_solid_color: RgbaColor::new(116, 116, 116, 255),
-            cave_water_color: RgbaColor::new(38, 82, 180, 255),
-            cave_lava_color: RgbaColor::new(255, 92, 12, 255),
-            min_height_color: RgbaColor::new(36, 52, 100, 255),
-            max_height_color: RgbaColor::new(242, 244, 232, 255),
-        };
-        palette.insert_default_biomes();
-        palette.insert_default_blocks();
-        if let Err(error) = palette.merge_builtin_cache() {
-            panic!("embedded bedrock-render palette cache is invalid: {error}");
-        }
-        if let Err(error) = palette.merge_json_str(BUILTIN_BIOME_COLOR_JSON) {
-            panic!("embedded bedrock-render biome palette is invalid: {error}");
-        }
-        palette
+        Self::from_builtin_json_sources().unwrap_or_else(|error| {
+            panic!("embedded bedrock-render palette JSON is invalid: {error}")
+        })
     }
 }
 
@@ -119,42 +110,43 @@ impl RenderPalette {
         Self::default()
     }
 
-    /// Builds the embedded palette from the auditable JSON sources only.
-    ///
-    /// This bypasses the embedded `BRPAL01` cache and is intended for cache
-    /// rebuild tools, source-data audits, and tests that need to prove the JSON
-    /// sources and binary cache describe the same palette.
+    /// Builds the embedded palette from the auditable JSON sources.
     ///
     /// # Errors
     ///
     /// Returns an error if either embedded JSON source is invalid.
     pub fn from_builtin_json_sources() -> Result<Self> {
-        let mut palette = Self {
+        let mut palette = Self::empty_with_builtin_defaults();
+        palette.insert_default_blocks();
+        palette.merge_json_str(BUILTIN_BLOCK_COLOR_JSON)?;
+        palette.merge_json_str(BUILTIN_BIOME_COLOR_JSON)?;
+        Ok(palette)
+    }
+
+    fn empty_with_builtin_defaults() -> Self {
+        Self {
             biome_colors: HashMap::new(),
             biome_grass_colors: HashMap::new(),
             biome_foliage_colors: HashMap::new(),
             biome_water_colors: HashMap::new(),
             block_colors: HashMap::new(),
+            block_state_colors: HashMap::new(),
+            block_variant_colors: HashMap::new(),
             unknown_biome_color: RgbaColor::new(255, 0, 255, 180),
             unknown_block_color: RgbaColor::new(255, 0, 255, 255),
             missing_chunk_color: RgbaColor::new(0, 0, 0, 0),
             void_color: RgbaColor::new(0, 0, 0, 0),
             air_color: RgbaColor::new(0, 0, 0, 0),
-            default_grass_color: RgbaColor::new(142, 185, 113, 255),
-            default_foliage_color: RgbaColor::new(113, 167, 77, 255),
-            default_water_color: RgbaColor::new(63, 118, 228, 255),
+            default_grass_color: RgbaColor::new(98, 151, 64, 255),
+            default_foliage_color: RgbaColor::new(62, 124, 50, 255),
+            default_water_color: RgbaColor::new(28, 76, 158, 255),
             cave_air_color: RgbaColor::new(12, 12, 14, 255),
             cave_solid_color: RgbaColor::new(116, 116, 116, 255),
             cave_water_color: RgbaColor::new(38, 82, 180, 255),
             cave_lava_color: RgbaColor::new(255, 92, 12, 255),
             min_height_color: RgbaColor::new(36, 52, 100, 255),
             max_height_color: RgbaColor::new(242, 244, 232, 255),
-        };
-        palette.insert_default_biomes();
-        palette.insert_default_blocks();
-        palette.merge_json_str(BUILTIN_BLOCK_COLOR_JSON)?;
-        palette.merge_json_str(BUILTIN_BIOME_COLOR_JSON)?;
-        Ok(palette)
+        }
     }
 
     /// Returns the embedded block-color JSON source.
@@ -169,21 +161,6 @@ impl RenderPalette {
         BUILTIN_BIOME_COLOR_JSON
     }
 
-    /// Returns the embedded compact binary palette cache.
-    #[must_use]
-    pub fn builtin_palette_cache_bytes() -> &'static [u8] {
-        BUILTIN_PALETTE_CACHE_BYTES
-    }
-
-    /// Merges the embedded binary palette cache into this palette.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the embedded cache bytes fail validation.
-    pub fn merge_builtin_cache(&mut self) -> Result<PaletteImportReport> {
-        self.merge_binary_slice(BUILTIN_PALETTE_CACHE_BYTES)
-    }
-
     /// Adds or replaces a biome color and returns the updated palette.
     #[must_use]
     pub fn with_biome_color(mut self, id: u32, color: RgbaColor) -> Self {
@@ -194,7 +171,10 @@ impl RenderPalette {
     /// Adds or replaces a block color and returns the updated palette.
     #[must_use]
     pub fn with_block_color(mut self, name: impl Into<String>, color: RgbaColor) -> Self {
-        self.block_colors.insert(name.into(), color);
+        let name = normalize_block_name(&name.into());
+        self.block_colors.insert(name.clone(), color);
+        self.block_state_colors.remove(&name);
+        self.block_variant_colors.remove(&name);
         self
     }
 
@@ -266,120 +246,6 @@ impl RenderPalette {
         Ok(report)
     }
 
-    /// Merges palette entries from a compact binary cache file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be read or if the cache bytes are invalid.
-    pub fn merge_binary_file(&mut self, path: impl AsRef<Path>) -> Result<PaletteImportReport> {
-        let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|error| {
-            BedrockRenderError::io(
-                format!("failed to read palette cache {}", path.display()),
-                error,
-            )
-        })?;
-        self.merge_binary_slice(&bytes)
-    }
-
-    /// Merges palette entries from compact `BRPAL01` cache bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the cache header, counts, names, or color records are invalid.
-    pub fn merge_binary_slice(&mut self, bytes: &[u8]) -> Result<PaletteImportReport> {
-        let mut cursor = Cursor::new(bytes);
-        let mut magic = [0_u8; 8];
-        cursor.read_exact(&mut magic).map_err(|error| {
-            BedrockRenderError::Validation(format!("invalid palette cache header: {error}"))
-        })?;
-        if &magic != PALETTE_CACHE_MAGIC {
-            return Err(BedrockRenderError::Validation(
-                "invalid palette cache magic".to_string(),
-            ));
-        }
-
-        let mut report = PaletteImportReport::default();
-        let biome_count = read_u32(&mut cursor, "biome count")?;
-        for _ in 0..biome_count {
-            let id = read_u32(&mut cursor, "biome id")?;
-            let color = read_rgba(&mut cursor, "biome color")?;
-            self.biome_colors.insert(id, color);
-            report.biome_colors += 1;
-        }
-
-        let block_count = read_u32(&mut cursor, "block count")?;
-        for _ in 0..block_count {
-            let name_len = usize::from(read_u16(&mut cursor, "block name length")?);
-            let mut name_bytes = vec![0_u8; name_len];
-            cursor.read_exact(&mut name_bytes).map_err(|error| {
-                BedrockRenderError::Validation(format!(
-                    "invalid block name in palette cache: {error}"
-                ))
-            })?;
-            let name = String::from_utf8(name_bytes).map_err(|error| {
-                BedrockRenderError::Validation(format!("invalid UTF-8 block name: {error}"))
-            })?;
-            let color = read_rgba(&mut cursor, "block color")?;
-            self.block_colors.insert(name, color);
-            report.block_colors += 1;
-        }
-        Ok(report)
-    }
-
-    /// Writes this palette as a compact binary cache file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the palette cannot be encoded or the file cannot be written.
-    pub fn write_binary_file(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        let bytes = self.to_binary_vec()?;
-        fs::write(path, bytes).map_err(|error| {
-            BedrockRenderError::io(
-                format!("failed to write palette cache {}", path.display()),
-                error,
-            )
-        })
-    }
-
-    /// Encodes this palette as compact `BRPAL01` bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the palette contains too many entries or an oversized block name.
-    pub fn to_binary_vec(&self) -> Result<Vec<u8>> {
-        let biome_count = u32::try_from(self.biome_colors.len()).map_err(|_| {
-            BedrockRenderError::Validation("too many biome colors for palette cache".to_string())
-        })?;
-        let block_count = u32::try_from(self.block_colors.len()).map_err(|_| {
-            BedrockRenderError::Validation("too many block colors for palette cache".to_string())
-        })?;
-        let mut bytes = Vec::with_capacity(16 + self.block_colors.len() * 40);
-        bytes.extend_from_slice(PALETTE_CACHE_MAGIC);
-        bytes.extend_from_slice(&biome_count.to_le_bytes());
-        let mut biome_colors = self.biome_colors.iter().collect::<Vec<_>>();
-        biome_colors.sort_by_key(|(id, _)| **id);
-        for (id, color) in biome_colors {
-            bytes.extend_from_slice(&id.to_le_bytes());
-            bytes.extend_from_slice(&color.to_array());
-        }
-        bytes.extend_from_slice(&block_count.to_le_bytes());
-        let mut block_colors = self.block_colors.iter().collect::<Vec<_>>();
-        block_colors.sort_by(|left, right| left.0.cmp(right.0));
-        for (name, color) in block_colors {
-            let name_len = u16::try_from(name.len()).map_err(|_| {
-                BedrockRenderError::Validation(format!(
-                    "block name too long for palette cache: {name}"
-                ))
-            })?;
-            bytes.extend_from_slice(&name_len.to_le_bytes());
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.extend_from_slice(&color.to_array());
-        }
-        Ok(bytes)
-    }
-
     /// Returns the configured biome color or the unknown-biome fallback.
     #[must_use]
     pub fn biome_color(&self, id: u32) -> RgbaColor {
@@ -423,29 +289,99 @@ impl RenderPalette {
         biome_tint: bool,
     ) -> RgbaColor {
         let color = self.block_color(name);
-        if !biome_tint {
-            return with_alpha(color, 255);
-        }
         if is_grass_tinted_block(name) {
-            return multiply_with_biome_tint(
-                color,
-                self.biome_grass_tint(biome_id),
-                self.default_grass_color,
-            );
+            if is_surface_grass_block(name) {
+                return self.surface_grass_block_color(color, biome_id, biome_tint);
+            }
+            let tint = if biome_tint {
+                self.biome_grass_tint(biome_id)
+            } else {
+                None
+            };
+            return multiply_with_biome_tint(color, tint, self.default_grass_color);
         }
         if is_foliage_tinted_block(name) {
-            return multiply_with_biome_tint(
-                color,
-                self.biome_foliage_tint(biome_id),
-                self.default_foliage_color,
-            );
+            let tint = if biome_tint {
+                self.biome_foliage_tint(biome_id)
+            } else {
+                None
+            };
+            return multiply_with_biome_tint(color, tint, self.default_foliage_color);
         }
         if is_water_block(name) {
-            return multiply_with_biome_tint(
-                color,
-                self.biome_water_tint(biome_id),
-                self.default_water_color,
-            );
+            let tint = if biome_tint {
+                self.biome_water_tint(biome_id)
+            } else {
+                None
+            };
+            let tinted = multiply_with_biome_tint(color, tint, self.default_water_color);
+            return blend_toward_color(tinted, tint.unwrap_or(self.default_water_color), 190);
+        }
+        with_alpha(color, 255)
+    }
+
+    /// Returns a block color with JSON-defined state overrides applied.
+    #[must_use]
+    pub(crate) fn block_state_color(&self, state: &BlockState) -> RgbaColor {
+        if is_air_block(&state.name) {
+            return self.air_color;
+        }
+        self.find_state_color(state)
+            .unwrap_or_else(|| self.block_color(&state.name))
+    }
+
+    /// Returns a JSON-defined variant color for a block, if one is available.
+    #[must_use]
+    pub(crate) fn block_variant_color(&self, name: &str, variant: &str) -> Option<RgbaColor> {
+        let normalized = normalize_block_name(name);
+        self.block_variant_colors
+            .get(&normalized)
+            .and_then(|variants| variants.get(variant))
+            .copied()
+            .or_else(|| {
+                name.strip_prefix("minecraft:")
+                    .and_then(|short_name| self.block_variant_colors.get(short_name))
+                    .and_then(|variants| variants.get(variant))
+                    .copied()
+            })
+    }
+
+    /// Returns a surface block color with JSON-defined state overrides and biome tinting applied.
+    #[must_use]
+    pub(crate) fn surface_block_state_color(
+        &self,
+        state: &BlockState,
+        biome_id: Option<u32>,
+        biome_tint: bool,
+    ) -> RgbaColor {
+        let color = self.block_state_color(state);
+        if is_grass_tinted_block(&state.name) {
+            if is_surface_grass_block(&state.name) {
+                return self.surface_grass_block_color(color, biome_id, biome_tint);
+            }
+            let tint = if biome_tint {
+                self.biome_grass_tint(biome_id)
+            } else {
+                None
+            };
+            return multiply_with_biome_tint(color, tint, self.default_grass_color);
+        }
+        if is_foliage_tinted_block(&state.name) {
+            let tint = if biome_tint {
+                self.biome_foliage_tint(biome_id)
+            } else {
+                None
+            };
+            return multiply_with_biome_tint(color, tint, self.default_foliage_color);
+        }
+        if is_water_block(&state.name) {
+            let tint = if biome_tint {
+                self.biome_water_tint(biome_id)
+            } else {
+                None
+            };
+            let tinted = multiply_with_biome_tint(color, tint, self.default_water_color);
+            return blend_toward_color(tinted, tint.unwrap_or(self.default_water_color), 190);
         }
         with_alpha(color, 255)
     }
@@ -464,7 +400,7 @@ impl RenderPalette {
         let under = under_name.map_or(self.missing_chunk_color, |name| {
             self.surface_block_color(name, biome_id, biome_tint)
         });
-        let water_alpha = u8_from_u16((u16::from(depth.min(7)) * 25).min(179));
+        let water_alpha = shallow_water_alpha(depth);
         alpha_blend(with_alpha(water, water_alpha), under)
     }
 
@@ -560,6 +496,30 @@ impl RenderPalette {
         biome_id.and_then(|id| self.biome_water_colors.get(&id).copied())
     }
 
+    #[must_use]
+    pub(crate) fn is_biome_surface_color(&self, color: RgbaColor) -> bool {
+        let color = with_alpha(color, 255);
+        self.biome_colors
+            .values()
+            .any(|candidate| with_alpha(*candidate, 255) == color)
+    }
+
+    fn surface_grass_block_color(
+        &self,
+        mask_color: RgbaColor,
+        biome_id: Option<u32>,
+        biome_tint: bool,
+    ) -> RgbaColor {
+        let tint = if biome_tint {
+            self.biome_grass_tint(biome_id)
+        } else {
+            None
+        };
+        let tint = tint.unwrap_or(self.default_grass_color);
+        let tinted = multiply_with_biome_tint(mask_color, Some(tint), self.default_grass_color);
+        blend_toward_color(tinted, tint, 96)
+    }
+
     /// Returns the transparent color used for missing chunks.
     #[must_use]
     pub const fn missing_chunk_color(&self) -> RgbaColor {
@@ -619,89 +579,6 @@ impl RenderPalette {
         self.cave_solid_color
     }
 
-    fn insert_default_biomes(&mut self) {
-        for (id, color) in [
-            (0, RgbaColor::new(141, 179, 96, 255)),
-            (1, RgbaColor::new(250, 148, 24, 255)),
-            (2, RgbaColor::new(250, 240, 192, 255)),
-            (3, RgbaColor::new(96, 96, 96, 255)),
-            (4, RgbaColor::new(5, 102, 33, 255)),
-            (5, RgbaColor::new(11, 102, 89, 255)),
-            (6, RgbaColor::new(7, 249, 178, 255)),
-            (7, RgbaColor::new(0, 0, 255, 255)),
-            (8, RgbaColor::new(255, 0, 0, 255)),
-            (9, RgbaColor::new(128, 128, 255, 255)),
-            (10, RgbaColor::new(160, 160, 255, 255)),
-            (11, RgbaColor::new(255, 255, 255, 255)),
-            (12, RgbaColor::new(160, 160, 160, 255)),
-            (13, RgbaColor::new(255, 255, 160, 255)),
-            (14, RgbaColor::new(0, 160, 0, 255)),
-            (15, RgbaColor::new(255, 200, 128, 255)),
-            (16, RgbaColor::new(255, 220, 160, 255)),
-            (17, RgbaColor::new(48, 116, 68, 255)),
-            (18, RgbaColor::new(27, 82, 54, 255)),
-            (19, RgbaColor::new(89, 102, 81, 255)),
-            (20, RgbaColor::new(69, 79, 62, 255)),
-            (21, RgbaColor::new(80, 112, 80, 255)),
-            (22, RgbaColor::new(129, 161, 129, 255)),
-            (23, RgbaColor::new(91, 95, 69, 255)),
-            (24, RgbaColor::new(30, 144, 255, 255)),
-            (25, RgbaColor::new(98, 140, 120, 255)),
-            (26, RgbaColor::new(112, 141, 129, 255)),
-            (27, RgbaColor::new(160, 167, 140, 255)),
-            (28, RgbaColor::new(119, 156, 98, 255)),
-            (29, RgbaColor::new(180, 180, 180, 255)),
-            (30, RgbaColor::new(160, 160, 180, 255)),
-            (31, RgbaColor::new(40, 60, 40, 255)),
-            (32, RgbaColor::new(50, 70, 50, 255)),
-            (33, RgbaColor::new(189, 178, 95, 255)),
-            (34, RgbaColor::new(167, 157, 100, 255)),
-            (35, RgbaColor::new(120, 120, 120, 255)),
-            (36, RgbaColor::new(80, 80, 80, 255)),
-            (37, RgbaColor::new(90, 120, 80, 255)),
-            (38, RgbaColor::new(130, 130, 100, 255)),
-            (39, RgbaColor::new(85, 107, 47, 255)),
-            (40, RgbaColor::new(255, 255, 255, 255)),
-            (41, RgbaColor::new(0, 0, 172, 255)),
-            (42, RgbaColor::new(45, 85, 180, 255)),
-            (43, RgbaColor::new(32, 70, 150, 255)),
-            (44, RgbaColor::new(32, 85, 150, 255)),
-            (45, RgbaColor::new(28, 65, 130, 255)),
-            (46, RgbaColor::new(90, 160, 190, 255)),
-            (47, RgbaColor::new(70, 120, 160, 255)),
-            (48, RgbaColor::new(80, 150, 70, 255)),
-            (49, RgbaColor::new(55, 120, 55, 255)),
-            (50, RgbaColor::new(189, 178, 95, 255)),
-            (81, RgbaColor::new(70, 100, 35, 255)),
-            (82, RgbaColor::new(80, 85, 38, 255)),
-            (129, RgbaColor::new(220, 220, 220, 255)),
-            (130, RgbaColor::new(255, 188, 64, 255)),
-            (131, RgbaColor::new(80, 80, 80, 255)),
-            (132, RgbaColor::new(34, 139, 34, 255)),
-            (133, RgbaColor::new(20, 120, 95, 255)),
-            (134, RgbaColor::new(35, 92, 70, 255)),
-            (140, RgbaColor::new(200, 220, 255, 255)),
-            (149, RgbaColor::new(30, 120, 30, 255)),
-            (151, RgbaColor::new(105, 130, 105, 255)),
-            (155, RgbaColor::new(120, 145, 90, 255)),
-            (156, RgbaColor::new(175, 175, 175, 255)),
-            (157, RgbaColor::new(110, 110, 130, 255)),
-            (158, RgbaColor::new(45, 70, 45, 255)),
-            (160, RgbaColor::new(177, 170, 90, 255)),
-            (161, RgbaColor::new(96, 120, 70, 255)),
-            (162, RgbaColor::new(178, 164, 90, 255)),
-            (163, RgbaColor::new(160, 140, 80, 255)),
-            (164, RgbaColor::new(140, 105, 65, 255)),
-            (165, RgbaColor::new(175, 120, 80, 255)),
-            (166, RgbaColor::new(150, 90, 70, 255)),
-            (167, RgbaColor::new(155, 120, 100, 255)),
-            (168, RgbaColor::new(60, 150, 80, 255)),
-            (169, RgbaColor::new(40, 120, 65, 255)),
-        ] {
-            self.biome_colors.insert(id, color);
-        }
-    }
-
     fn merge_json_value(&mut self, value: &Value, report: &mut PaletteImportReport) -> Result<()> {
         match value {
             Value::Object(map) => {
@@ -746,7 +623,20 @@ impl RenderPalette {
                         report.skipped_entries += 1;
                         continue;
                     };
-                    self.block_colors.insert(normalize_block_name(name), color);
+                    let normalized_name = normalize_block_name(name);
+                    self.block_colors.insert(normalized_name.clone(), color);
+                    if let Some(rules) = parse_block_state_color_rules(entry) {
+                        self.block_state_colors
+                            .insert(normalized_name.clone(), rules);
+                    } else {
+                        self.block_state_colors.remove(&normalized_name);
+                    }
+                    if let Some(variants) = parse_block_variant_colors(entry) {
+                        self.block_variant_colors
+                            .insert(normalized_name.clone(), variants);
+                    } else {
+                        self.block_variant_colors.remove(&normalized_name);
+                    }
                     report.block_colors += 1;
                 }
                 Ok(())
@@ -757,7 +647,20 @@ impl RenderPalette {
                         report.skipped_entries += 1;
                         continue;
                     };
-                    self.block_colors.insert(normalize_block_name(&name), color);
+                    let normalized_name = normalize_block_name(&name);
+                    self.block_colors.insert(normalized_name.clone(), color);
+                    if let Some(rules) = parse_block_state_color_rules(entry) {
+                        self.block_state_colors
+                            .insert(normalized_name.clone(), rules);
+                    } else {
+                        self.block_state_colors.remove(&normalized_name);
+                    }
+                    if let Some(variants) = parse_block_variant_colors(entry) {
+                        self.block_variant_colors
+                            .insert(normalized_name.clone(), variants);
+                    } else {
+                        self.block_variant_colors.remove(&normalized_name);
+                    }
                     report.block_colors += 1;
                 }
                 Ok(())
@@ -858,396 +761,19 @@ impl RenderPalette {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn insert_default_blocks(&mut self) {
-        for (name, color) in [
-            ("minecraft:air", self.air_color),
-            ("air", self.air_color),
-            ("minecraft:grass", RgbaColor::new(88, 150, 62, 255)),
-            ("minecraft:short_grass", RgbaColor::new(88, 150, 62, 255)),
-            ("minecraft:tall_grass", RgbaColor::new(88, 150, 62, 255)),
-            ("minecraft:grass_block", RgbaColor::new(102, 158, 74, 255)),
-            ("minecraft:farmland", RgbaColor::new(108, 76, 48, 255)),
-            ("minecraft:podzol", RgbaColor::new(119, 86, 51, 255)),
-            ("minecraft:mycelium", RgbaColor::new(112, 96, 112, 255)),
-            ("minecraft:moss_block", RgbaColor::new(86, 118, 38, 255)),
-            ("minecraft:dirt", RgbaColor::new(134, 96, 67, 255)),
-            ("minecraft:coarse_dirt", RgbaColor::new(119, 85, 61, 255)),
-            ("minecraft:rooted_dirt", RgbaColor::new(113, 82, 57, 255)),
-            ("minecraft:stone", RgbaColor::new(125, 125, 125, 255)),
-            ("minecraft:deepslate", RgbaColor::new(80, 80, 82, 255)),
-            ("minecraft:cobblestone", RgbaColor::new(109, 109, 109, 255)),
-            ("minecraft:granite", RgbaColor::new(149, 103, 85, 255)),
-            ("minecraft:diorite", RgbaColor::new(190, 190, 190, 255)),
-            ("minecraft:andesite", RgbaColor::new(136, 136, 136, 255)),
-            ("minecraft:tuff", RgbaColor::new(92, 92, 86, 255)),
-            ("minecraft:calcite", RgbaColor::new(224, 222, 214, 255)),
-            (
-                "minecraft:dripstone_block",
-                RgbaColor::new(138, 105, 83, 255),
-            ),
-            ("minecraft:sand", RgbaColor::new(218, 210, 158, 255)),
-            ("minecraft:sandstone", RgbaColor::new(216, 203, 145, 255)),
-            ("minecraft:red_sand", RgbaColor::new(190, 103, 33, 255)),
-            ("minecraft:red_sandstone", RgbaColor::new(178, 88, 30, 255)),
-            ("minecraft:gravel", RgbaColor::new(126, 122, 118, 255)),
-            ("minecraft:clay", RgbaColor::new(160, 166, 176, 255)),
-            ("minecraft:mud", RgbaColor::new(63, 54, 50, 255)),
-            ("minecraft:water", RgbaColor::new(43, 92, 210, 190)),
-            ("minecraft:flowing_water", RgbaColor::new(43, 92, 210, 190)),
-            ("minecraft:ice", RgbaColor::new(160, 210, 255, 210)),
-            ("minecraft:packed_ice", RgbaColor::new(130, 185, 242, 235)),
-            ("minecraft:blue_ice", RgbaColor::new(102, 167, 240, 235)),
-            ("minecraft:snow", RgbaColor::new(245, 250, 250, 255)),
-            ("minecraft:snow_layer", RgbaColor::new(245, 250, 250, 230)),
-            ("minecraft:oak_leaves", RgbaColor::new(60, 112, 42, 245)),
-            ("minecraft:spruce_leaves", RgbaColor::new(46, 86, 46, 245)),
-            ("minecraft:birch_leaves", RgbaColor::new(85, 124, 49, 245)),
-            ("minecraft:jungle_leaves", RgbaColor::new(42, 108, 44, 245)),
-            ("minecraft:acacia_leaves", RgbaColor::new(72, 112, 44, 245)),
-            ("minecraft:dark_oak_leaves", RgbaColor::new(38, 82, 36, 245)),
-            ("minecraft:mangrove_leaves", RgbaColor::new(44, 98, 44, 245)),
-            (
-                "minecraft:cherry_leaves",
-                RgbaColor::new(244, 174, 188, 245),
-            ),
-            ("minecraft:leaves", RgbaColor::new(60, 112, 42, 245)),
-            ("minecraft:leaves2", RgbaColor::new(60, 112, 42, 245)),
-            ("minecraft:log", RgbaColor::new(102, 76, 45, 255)),
-            ("minecraft:oak_log", RgbaColor::new(102, 76, 45, 255)),
-            ("minecraft:birch_log", RgbaColor::new(197, 184, 135, 255)),
-            ("minecraft:spruce_log", RgbaColor::new(76, 55, 34, 255)),
-            ("minecraft:jungle_log", RgbaColor::new(105, 78, 43, 255)),
-            ("minecraft:acacia_log", RgbaColor::new(138, 75, 42, 255)),
-            ("minecraft:dark_oak_log", RgbaColor::new(58, 39, 23, 255)),
-            ("minecraft:mangrove_log", RgbaColor::new(91, 48, 43, 255)),
-            ("minecraft:cherry_log", RgbaColor::new(126, 78, 85, 255)),
-            ("minecraft:planks", RgbaColor::new(157, 128, 79, 255)),
-            ("minecraft:oak_planks", RgbaColor::new(157, 128, 79, 255)),
-            ("minecraft:birch_planks", RgbaColor::new(196, 178, 116, 255)),
-            ("minecraft:spruce_planks", RgbaColor::new(114, 84, 48, 255)),
-            ("minecraft:jungle_planks", RgbaColor::new(154, 109, 77, 255)),
-            ("minecraft:acacia_planks", RgbaColor::new(174, 92, 50, 255)),
-            ("minecraft:dark_oak_planks", RgbaColor::new(75, 50, 28, 255)),
-            (
-                "minecraft:mangrove_planks",
-                RgbaColor::new(116, 54, 48, 255),
-            ),
-            (
-                "minecraft:cherry_planks",
-                RgbaColor::new(227, 164, 174, 255),
-            ),
-            ("minecraft:cactus", RgbaColor::new(35, 116, 49, 255)),
-            ("minecraft:sugar_cane", RgbaColor::new(96, 178, 64, 255)),
-            ("minecraft:reeds", RgbaColor::new(96, 178, 64, 255)),
-            ("minecraft:bamboo", RgbaColor::new(119, 150, 45, 255)),
-            ("minecraft:wheat", RgbaColor::new(193, 174, 72, 255)),
-            ("minecraft:carrots", RgbaColor::new(83, 142, 45, 255)),
-            ("minecraft:potatoes", RgbaColor::new(90, 145, 48, 255)),
-            ("minecraft:beetroot", RgbaColor::new(118, 72, 54, 255)),
-            ("minecraft:pumpkin_stem", RgbaColor::new(96, 150, 54, 255)),
-            ("minecraft:melon_stem", RgbaColor::new(96, 150, 54, 255)),
-            ("minecraft:double_plant", RgbaColor::new(88, 150, 62, 255)),
-            ("minecraft:large_fern", RgbaColor::new(76, 132, 55, 255)),
-            ("minecraft:fern", RgbaColor::new(76, 132, 55, 255)),
-            ("minecraft:bush", RgbaColor::new(58, 112, 46, 255)),
-            ("minecraft:azalea", RgbaColor::new(66, 118, 52, 255)),
-            (
-                "minecraft:flowering_azalea",
-                RgbaColor::new(92, 128, 64, 255),
-            ),
-            ("minecraft:mangrove_roots", RgbaColor::new(72, 55, 43, 255)),
-            (
-                "minecraft:muddy_mangrove_roots",
-                RgbaColor::new(67, 52, 43, 255),
-            ),
-            ("minecraft:pink_petals", RgbaColor::new(238, 148, 184, 255)),
-            ("minecraft:wildflowers", RgbaColor::new(214, 180, 82, 255)),
-            ("minecraft:leaf_litter", RgbaColor::new(132, 88, 44, 255)),
-            ("minecraft:yellow_flower", RgbaColor::new(230, 204, 56, 255)),
-            ("minecraft:red_flower", RgbaColor::new(196, 44, 40, 255)),
-            ("minecraft:poppy", RgbaColor::new(196, 44, 40, 255)),
-            ("minecraft:dandelion", RgbaColor::new(230, 204, 56, 255)),
-            ("minecraft:blue_orchid", RgbaColor::new(50, 150, 190, 255)),
-            ("minecraft:allium", RgbaColor::new(154, 92, 190, 255)),
-            ("minecraft:azure_bluet", RgbaColor::new(230, 230, 215, 255)),
-            ("minecraft:oxeye_daisy", RgbaColor::new(232, 232, 220, 255)),
-            ("minecraft:cornflower", RgbaColor::new(72, 105, 190, 255)),
-            (
-                "minecraft:lily_of_the_valley",
-                RgbaColor::new(238, 238, 226, 255),
-            ),
-            ("minecraft:sunflower", RgbaColor::new(229, 184, 40, 255)),
-            ("minecraft:lilac", RgbaColor::new(190, 130, 190, 255)),
-            ("minecraft:rose_bush", RgbaColor::new(178, 40, 70, 255)),
-            ("minecraft:peony", RgbaColor::new(220, 142, 180, 255)),
-            (
-                "minecraft:brown_mushroom",
-                RgbaColor::new(145, 109, 83, 255),
-            ),
-            ("minecraft:red_mushroom", RgbaColor::new(182, 54, 45, 255)),
-            ("minecraft:deadbush", RgbaColor::new(125, 91, 48, 255)),
-            ("minecraft:sapling", RgbaColor::new(65, 125, 47, 255)),
-            ("minecraft:seagrass", RgbaColor::new(44, 124, 80, 255)),
-            ("minecraft:kelp", RgbaColor::new(48, 110, 72, 255)),
-            ("minecraft:lily_pad", RgbaColor::new(44, 115, 52, 255)),
-            ("minecraft:glow_lichen", RgbaColor::new(137, 157, 145, 210)),
-            ("minecraft:torch", RgbaColor::new(245, 190, 78, 255)),
-            ("minecraft:lantern", RgbaColor::new(198, 150, 82, 255)),
-            ("minecraft:rail", RgbaColor::new(116, 108, 96, 255)),
-            ("minecraft:iron_bars", RgbaColor::new(132, 132, 132, 210)),
-            ("minecraft:piston", RgbaColor::new(112, 98, 74, 255)),
-            ("minecraft:sticky_piston", RgbaColor::new(94, 116, 70, 255)),
-            ("minecraft:hopper", RgbaColor::new(72, 78, 82, 255)),
-            ("minecraft:lever", RgbaColor::new(118, 104, 78, 255)),
-            ("minecraft:scaffolding", RgbaColor::new(190, 162, 89, 235)),
-            ("minecraft:fire", RgbaColor::new(242, 98, 18, 210)),
-            ("minecraft:lava", RgbaColor::new(255, 90, 0, 255)),
-            ("minecraft:flowing_lava", RgbaColor::new(255, 90, 0, 255)),
-            ("minecraft:bubble_column", RgbaColor::new(72, 128, 220, 120)),
-            ("minecraft:netherrack", RgbaColor::new(110, 53, 51, 255)),
-            ("minecraft:basalt", RgbaColor::new(74, 72, 76, 255)),
-            ("minecraft:blackstone", RgbaColor::new(42, 36, 43, 255)),
-            ("minecraft:soul_sand", RgbaColor::new(82, 64, 56, 255)),
-            ("minecraft:soul_soil", RgbaColor::new(77, 60, 52, 255)),
-            ("minecraft:warped_nylium", RgbaColor::new(43, 106, 103, 255)),
-            ("minecraft:crimson_nylium", RgbaColor::new(117, 33, 45, 255)),
-            ("minecraft:shroomlight", RgbaColor::new(240, 158, 88, 255)),
-            ("minecraft:weeping_vines", RgbaColor::new(126, 35, 54, 235)),
-            ("minecraft:end_stone", RgbaColor::new(220, 222, 158, 255)),
-            ("minecraft:end_portal", RgbaColor::new(24, 18, 34, 180)),
-            ("minecraft:obsidian", RgbaColor::new(26, 20, 39, 255)),
-            ("minecraft:bedrock", RgbaColor::new(84, 84, 84, 255)),
-            ("minecraft:terracotta", RgbaColor::new(152, 94, 67, 255)),
-            (
-                "minecraft:white_terracotta",
-                RgbaColor::new(210, 178, 161, 255),
-            ),
-            (
-                "minecraft:orange_terracotta",
-                RgbaColor::new(162, 84, 38, 255),
-            ),
-            (
-                "minecraft:yellow_terracotta",
-                RgbaColor::new(186, 133, 36, 255),
-            ),
-            ("minecraft:red_terracotta", RgbaColor::new(143, 61, 47, 255)),
-            (
-                "minecraft:brown_terracotta",
-                RgbaColor::new(92, 61, 45, 255),
-            ),
-            ("minecraft:gray_terracotta", RgbaColor::new(57, 42, 36, 255)),
-            (
-                "minecraft:light_gray_terracotta",
-                RgbaColor::new(135, 107, 98, 255),
-            ),
-            ("minecraft:concrete", RgbaColor::new(128, 128, 128, 255)),
-            (
-                "minecraft:white_concrete",
-                RgbaColor::new(207, 213, 214, 255),
-            ),
-            ("minecraft:orange_concrete", RgbaColor::new(224, 97, 0, 255)),
-            (
-                "minecraft:yellow_concrete",
-                RgbaColor::new(241, 175, 21, 255),
-            ),
-            ("minecraft:green_concrete", RgbaColor::new(73, 91, 36, 255)),
-            ("minecraft:blue_concrete", RgbaColor::new(45, 47, 143, 255)),
-            ("minecraft:white_wool", RgbaColor::new(234, 236, 237, 255)),
-            ("minecraft:orange_wool", RgbaColor::new(241, 118, 20, 255)),
-            ("minecraft:yellow_wool", RgbaColor::new(248, 197, 39, 255)),
-            ("minecraft:green_wool", RgbaColor::new(84, 109, 27, 255)),
-            ("minecraft:blue_wool", RgbaColor::new(53, 57, 157, 255)),
+        for name in [
+            "air",
+            "minecraft:air",
+            "minecraft:cave_air",
+            "minecraft:void_air",
+            "minecraft:structure_void",
+            "minecraft:light",
+            "minecraft:light_block",
         ] {
-            self.block_colors.insert(name.to_string(), color);
-        }
-        self.insert_generated_wood_defaults();
-        self.insert_generated_dye_defaults();
-        self.insert_generated_ore_defaults();
-        self.insert_generated_utility_defaults();
-    }
-
-    fn insert_generated_wood_defaults(&mut self) {
-        for (wood, log, plank, leaves) in [
-            (
-                "oak",
-                RgbaColor::new(102, 76, 45, 255),
-                RgbaColor::new(157, 128, 79, 255),
-                RgbaColor::new(60, 112, 42, 245),
-            ),
-            (
-                "spruce",
-                RgbaColor::new(76, 55, 34, 255),
-                RgbaColor::new(114, 84, 48, 255),
-                RgbaColor::new(46, 86, 46, 245),
-            ),
-            (
-                "birch",
-                RgbaColor::new(197, 184, 135, 255),
-                RgbaColor::new(196, 178, 116, 255),
-                RgbaColor::new(85, 124, 49, 245),
-            ),
-            (
-                "jungle",
-                RgbaColor::new(105, 78, 43, 255),
-                RgbaColor::new(154, 109, 77, 255),
-                RgbaColor::new(42, 108, 44, 245),
-            ),
-            (
-                "acacia",
-                RgbaColor::new(138, 75, 42, 255),
-                RgbaColor::new(174, 92, 50, 255),
-                RgbaColor::new(72, 112, 44, 245),
-            ),
-            (
-                "dark_oak",
-                RgbaColor::new(58, 39, 23, 255),
-                RgbaColor::new(75, 50, 28, 255),
-                RgbaColor::new(38, 82, 36, 245),
-            ),
-            (
-                "mangrove",
-                RgbaColor::new(91, 48, 43, 255),
-                RgbaColor::new(116, 54, 48, 255),
-                RgbaColor::new(44, 98, 44, 245),
-            ),
-            (
-                "cherry",
-                RgbaColor::new(126, 78, 85, 255),
-                RgbaColor::new(227, 164, 174, 255),
-                RgbaColor::new(244, 174, 188, 245),
-            ),
-            (
-                "bamboo",
-                RgbaColor::new(119, 150, 45, 255),
-                RgbaColor::new(196, 174, 88, 255),
-                RgbaColor::new(119, 150, 45, 255),
-            ),
-            (
-                "crimson",
-                RgbaColor::new(122, 43, 72, 255),
-                RgbaColor::new(126, 49, 83, 255),
-                RgbaColor::new(96, 31, 70, 245),
-            ),
-            (
-                "warped",
-                RgbaColor::new(42, 112, 108, 255),
-                RgbaColor::new(44, 122, 116, 255),
-                RgbaColor::new(32, 104, 96, 245),
-            ),
-        ] {
-            for (suffix, color) in [
-                ("log", log),
-                ("wood", log),
-                ("stripped_log", plank),
-                ("stripped_wood", plank),
-                ("planks", plank),
-                ("stairs", plank),
-                ("slab", plank),
-                ("fence", plank),
-                ("fence_gate", plank),
-                ("door", plank),
-                ("trapdoor", plank),
-                ("button", plank),
-                ("pressure_plate", plank),
-                ("sign", plank),
-                ("hanging_sign", plank),
-                ("leaves", leaves),
-                ("sapling", leaves),
-            ] {
-                self.block_colors
-                    .insert(format!("minecraft:{wood}_{suffix}"), color);
-            }
+            self.block_colors.insert(name.to_string(), self.air_color);
         }
     }
-
-    fn insert_generated_dye_defaults(&mut self) {
-        for (color_name, color) in [
-            ("white", RgbaColor::new(232, 236, 236, 255)),
-            ("light_gray", RgbaColor::new(142, 142, 134, 255)),
-            ("gray", RgbaColor::new(62, 68, 71, 255)),
-            ("black", RgbaColor::new(21, 21, 26, 255)),
-            ("brown", RgbaColor::new(96, 59, 31, 255)),
-            ("red", RgbaColor::new(150, 42, 38, 255)),
-            ("orange", RgbaColor::new(224, 97, 0, 255)),
-            ("yellow", RgbaColor::new(241, 175, 21, 255)),
-            ("lime", RgbaColor::new(112, 185, 25, 255)),
-            ("green", RgbaColor::new(73, 91, 36, 255)),
-            ("cyan", RgbaColor::new(21, 137, 145, 255)),
-            ("light_blue", RgbaColor::new(58, 175, 217, 255)),
-            ("blue", RgbaColor::new(45, 47, 143, 255)),
-            ("purple", RgbaColor::new(120, 50, 167, 255)),
-            ("magenta", RgbaColor::new(190, 68, 201, 255)),
-            ("pink", RgbaColor::new(237, 141, 172, 255)),
-        ] {
-            for suffix in [
-                "wool",
-                "carpet",
-                "concrete",
-                "concrete_powder",
-                "terracotta",
-                "stained_glass",
-                "stained_glass_pane",
-                "glazed_terracotta",
-                "shulker_box",
-                "candle",
-                "bed",
-            ] {
-                self.block_colors
-                    .insert(format!("minecraft:{color_name}_{suffix}"), color);
-            }
-        }
-    }
-
-    fn insert_generated_ore_defaults(&mut self) {
-        for (name, color) in [
-            ("coal", RgbaColor::new(52, 52, 52, 255)),
-            ("iron", RgbaColor::new(190, 160, 130, 255)),
-            ("copper", RgbaColor::new(190, 112, 72, 255)),
-            ("gold", RgbaColor::new(232, 190, 62, 255)),
-            ("redstone", RgbaColor::new(170, 42, 42, 255)),
-            ("emerald", RgbaColor::new(58, 190, 95, 255)),
-            ("lapis", RgbaColor::new(48, 88, 180, 255)),
-            ("diamond", RgbaColor::new(92, 210, 218, 255)),
-            ("quartz", RgbaColor::new(226, 218, 205, 255)),
-            ("nether_gold", RgbaColor::new(198, 134, 45, 255)),
-        ] {
-            for suffix in ["ore", "block"] {
-                self.block_colors
-                    .insert(format!("minecraft:{name}_{suffix}"), color);
-            }
-            self.block_colors
-                .insert(format!("minecraft:deepslate_{name}_ore"), darken(color, 32));
-        }
-    }
-
-    fn insert_generated_utility_defaults(&mut self) {
-        for (name, color) in [
-            ("crafting_table", RgbaColor::new(142, 101, 58, 255)),
-            ("furnace", RgbaColor::new(92, 92, 92, 255)),
-            ("blast_furnace", RgbaColor::new(82, 82, 86, 255)),
-            ("smoker", RgbaColor::new(92, 76, 60, 255)),
-            ("chest", RgbaColor::new(154, 105, 42, 255)),
-            ("trapped_chest", RgbaColor::new(154, 105, 42, 255)),
-            ("ender_chest", RgbaColor::new(42, 68, 72, 255)),
-            ("barrel", RgbaColor::new(116, 79, 45, 255)),
-            ("bookshelf", RgbaColor::new(132, 88, 48, 255)),
-            ("lectern", RgbaColor::new(130, 90, 52, 255)),
-            ("anvil", RgbaColor::new(72, 72, 72, 255)),
-            ("grindstone", RgbaColor::new(132, 124, 112, 255)),
-            ("loom", RgbaColor::new(151, 127, 83, 255)),
-            ("cartography_table", RgbaColor::new(128, 104, 72, 255)),
-            ("smithing_table", RgbaColor::new(86, 66, 52, 255)),
-            ("stonecutter", RgbaColor::new(108, 108, 108, 255)),
-            ("composter", RgbaColor::new(94, 67, 38, 255)),
-            ("beehive", RgbaColor::new(190, 145, 55, 255)),
-            ("bee_nest", RgbaColor::new(185, 145, 70, 255)),
-            ("bell", RgbaColor::new(220, 170, 62, 255)),
-        ] {
-            self.block_colors.insert(format!("minecraft:{name}"), color);
-        }
-    }
-
     fn find_block_color(&self, name: &str) -> Option<RgbaColor> {
         self.block_colors
             .get(name)
@@ -1257,6 +783,44 @@ impl RenderPalette {
                     .and_then(|short_name| self.block_colors.get(short_name).copied())
             })
             .or_else(|| category_block_color(name))
+    }
+
+    fn find_state_color(&self, state: &BlockState) -> Option<RgbaColor> {
+        let normalized = normalize_block_name(&state.name);
+        self.block_state_colors
+            .get(&normalized)
+            .and_then(|rules| rules.color_for_state(state))
+            .or_else(|| {
+                state
+                    .name
+                    .strip_prefix("minecraft:")
+                    .and_then(|short_name| self.block_state_colors.get(short_name))
+                    .and_then(|rules| rules.color_for_state(state))
+            })
+    }
+}
+
+impl BlockStateColorRules {
+    fn color_for_state(&self, state: &BlockState) -> Option<RgbaColor> {
+        self.rules.iter().find_map(|rule| rule.matches(state))
+    }
+}
+
+impl BlockStateColorRule {
+    fn matches(&self, state: &BlockState) -> Option<RgbaColor> {
+        match &self.selector {
+            StateColorSelector::IntRange { min, max } => {
+                let value = state_int(state, &self.state_name)?;
+                ((*min..=*max).contains(&value)).then_some(self.color)
+            }
+            StateColorSelector::StringValues(values) => {
+                let value = state_string(state, &self.state_name)?;
+                values
+                    .iter()
+                    .any(|candidate| candidate == value)
+                    .then_some(self.color)
+            }
+        }
     }
 }
 
@@ -1271,6 +835,31 @@ fn is_air_block(name: &str) -> bool {
             | "minecraft:light_block"
             | "minecraft:light"
     )
+}
+
+fn state_int(state: &BlockState, key: &str) -> Option<i32> {
+    let value = state
+        .states
+        .get(key)
+        .or_else(|| state.states.get(&format!("minecraft:{key}")))?;
+    match value {
+        NbtTag::Byte(value) => Some(i32::from(*value)),
+        NbtTag::Short(value) => Some(i32::from(*value)),
+        NbtTag::Int(value) => Some(*value),
+        NbtTag::Long(value) => i32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn state_string<'a>(state: &'a BlockState, key: &str) -> Option<&'a str> {
+    let value = state
+        .states
+        .get(key)
+        .or_else(|| state.states.get(&format!("minecraft:{key}")))?;
+    match value {
+        NbtTag::String(value) => Some(value.as_str()),
+        _ => None,
+    }
 }
 
 fn looks_like_biome_map(map: &serde_json::Map<String, Value>) -> bool {
@@ -1328,7 +917,7 @@ fn parse_nested_color(value: &Value) -> Option<RgbaColor> {
     let Value::Object(map) = value else {
         return None;
     };
-    for key in ["color", "map_color", "rgba", "rgb"] {
+    for key in ["default", "color", "map_color", "rgba", "rgb"] {
         if let Some(color) = map.get(key).and_then(parse_color) {
             return Some(color);
         }
@@ -1344,12 +933,65 @@ fn parse_nested_block_color(block_name: &str, value: &Value) -> Option<RgbaColor
     let Value::Object(map) = value else {
         return None;
     };
-    for key in ["color", "map_color", "rgba", "rgb"] {
+    for key in ["default", "color", "map_color", "rgba", "rgb"] {
         if let Some(color) = map.get(key).and_then(parse_color) {
             return Some(color);
         }
     }
     best_child_color_for_block(block_name, map).or_else(|| average_child_colors(map))
+}
+
+fn parse_block_state_color_rules(value: &Value) -> Option<BlockStateColorRules> {
+    let map = value.as_object()?;
+    let state_colors = map.get("state_colors")?.as_object()?;
+    let mut rules = Vec::new();
+    for (state_name, state_rules) in state_colors {
+        for rule in state_rules.as_array()? {
+            let rule_map = rule.as_object()?;
+            let color = rule_map.get("color").and_then(parse_color)?;
+            if let Some(values) = rule_map.get("values").and_then(Value::as_array) {
+                let values = values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !values.is_empty() {
+                    rules.push(BlockStateColorRule {
+                        state_name: state_name.clone(),
+                        selector: StateColorSelector::StringValues(values),
+                        color,
+                    });
+                }
+                continue;
+            }
+            let min = rule_map
+                .get("min")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())?;
+            let max = rule_map
+                .get("max")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())?;
+            rules.push(BlockStateColorRule {
+                state_name: state_name.clone(),
+                selector: StateColorSelector::IntRange { min, max },
+                color,
+            });
+        }
+    }
+    (!rules.is_empty()).then_some(BlockStateColorRules { rules })
+}
+
+fn parse_block_variant_colors(value: &Value) -> Option<HashMap<String, RgbaColor>> {
+    let map = value.as_object()?;
+    let variant_colors = map.get("variant_colors")?.as_object()?;
+    let mut variants = HashMap::new();
+    for (variant, color) in variant_colors {
+        if let Some(color) = parse_color(color) {
+            variants.insert(variant.clone(), color);
+        }
+    }
+    (!variants.is_empty()).then_some(variants)
 }
 
 fn best_child_color_for_block(
@@ -1522,30 +1164,6 @@ fn parse_integer_color(value: u64) -> Option<RgbaColor> {
     ))
 }
 
-fn read_u16(cursor: &mut Cursor<&[u8]>, label: &str) -> Result<u16> {
-    let mut bytes = [0_u8; 2];
-    cursor
-        .read_exact(&mut bytes)
-        .map_err(|error| BedrockRenderError::Validation(format!("invalid {label}: {error}")))?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_u32(cursor: &mut Cursor<&[u8]>, label: &str) -> Result<u32> {
-    let mut bytes = [0_u8; 4];
-    cursor
-        .read_exact(&mut bytes)
-        .map_err(|error| BedrockRenderError::Validation(format!("invalid {label}: {error}")))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_rgba(cursor: &mut Cursor<&[u8]>, label: &str) -> Result<RgbaColor> {
-    let mut bytes = [0_u8; 4];
-    cursor
-        .read_exact(&mut bytes)
-        .map_err(|error| BedrockRenderError::Validation(format!("invalid {label}: {error}")))?;
-    Ok(RgbaColor::new(bytes[0], bytes[1], bytes[2], bytes[3]))
-}
-
 fn is_water_block(name: &str) -> bool {
     matches!(
         name,
@@ -1554,50 +1172,98 @@ fn is_water_block(name: &str) -> bool {
 }
 
 fn is_grass_tinted_block(name: &str) -> bool {
-    name.contains("grass_block")
-        || name.ends_with(":grass")
-        || name.ends_with(":short_grass")
-        || name.ends_with(":tall_grass")
+    if is_untinted_path_block(name) {
+        return false;
+    }
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    name == "grass"
+        || name == "short_grass"
+        || name == "tall_grass"
+        || name.contains("grass_block")
         || name.contains("fern")
         || name.contains("vine")
 }
 
+fn is_surface_grass_block(name: &str) -> bool {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    name == "grass" || name.contains("grass_block")
+}
+
 fn is_foliage_tinted_block(name: &str) -> bool {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    if name.contains("leaf_litter") {
+        return false;
+    }
     name.contains("leaves")
         || name.contains("leaf")
         || name.contains("leave")
         || name.contains("foliage")
 }
 
+fn is_untinted_path_block(name: &str) -> bool {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    matches!(name, "grass_path" | "dirt_path")
+}
+
 #[allow(clippy::too_many_lines)]
 fn category_block_color(name: &str) -> Option<RgbaColor> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    if is_untinted_path_block(name) {
+        return Some(RgbaColor::new(154, 118, 62, 255));
+    }
+    if matches!(name, "bamboo" | "bamboo_sapling") {
+        return Some(RgbaColor::new(68, 176, 32, 255));
+    }
+    if name == "decorated_pot" {
+        return Some(RgbaColor::new(132, 94, 54, 255));
+    }
+    if name.contains("bamboo")
+        && (name.contains("planks")
+            || name.contains("mosaic")
+            || name.contains("block")
+            || name.contains("door")
+            || name.contains("trapdoor")
+            || name.contains("fence")
+            || name.contains("slab")
+            || name.contains("stairs"))
+    {
+        return Some(RgbaColor::new(174, 150, 70, 255));
+    }
     if name.contains("coral") {
-        return Some(RgbaColor::new(210, 88, 110, 255));
+        return Some(RgbaColor::new(170, 78, 100, 255));
+    }
+    if is_water_block(name) {
+        return Some(RgbaColor::new(168, 190, 224, 210));
+    }
+    if is_grass_tinted_block(name) {
+        return Some(RgbaColor::new(214, 214, 214, 255));
+    }
+    if is_foliage_tinted_block(name) {
+        return Some(RgbaColor::new(206, 206, 206, 238));
     }
     if name.contains("copper") {
-        return Some(RgbaColor::new(179, 109, 77, 255));
+        return Some(RgbaColor::new(150, 84, 60, 255));
     }
     if name.contains("resin") {
-        return Some(RgbaColor::new(226, 112, 32, 255));
+        return Some(RgbaColor::new(194, 86, 24, 255));
     }
     if name.contains("amethyst") {
-        return Some(RgbaColor::new(154, 112, 210, 255));
+        return Some(RgbaColor::new(132, 88, 176, 255));
     }
     if name.contains("prismarine") {
-        return Some(RgbaColor::new(86, 154, 146, 255));
+        return Some(RgbaColor::new(62, 124, 120, 255));
     }
     if name.contains("basalt") || name.contains("blackstone") {
         return Some(RgbaColor::new(42, 38, 45, 255));
     }
     if name.contains("netherrack") || name.contains("nylium") || name.contains("wart") {
-        return Some(RgbaColor::new(112, 42, 44, 255));
+        return Some(RgbaColor::new(90, 34, 40, 255));
     }
     if name.contains("end_stone") || name.contains("end_brick") {
-        return Some(RgbaColor::new(218, 222, 158, 255));
+        return Some(RgbaColor::new(190, 190, 130, 255));
     }
     if name.contains("ore") {
-        return Some(RgbaColor::new(118, 118, 118, 255));
+        return Some(RgbaColor::new(96, 98, 98, 255));
     }
     if name.contains("stone")
         || name.contains("slate")
@@ -1607,21 +1273,17 @@ fn category_block_color(name: &str) -> Option<RgbaColor> {
         || name.contains("chiseled")
         || name.contains("tile")
     {
-        return Some(RgbaColor::new(122, 122, 122, 255));
-    }
-    if name.contains("leaves") || name.contains("leaf") {
-        return Some(RgbaColor::new(58, 105, 42, 245));
+        return Some(RgbaColor::new(100, 102, 100, 255));
     }
     if name.contains("log")
         || name.contains("stem")
         || name.contains("wood")
         || name.contains("hyphae")
-        || name.contains("bamboo")
     {
-        return Some(RgbaColor::new(99, 70, 42, 255));
+        return Some(RgbaColor::new(86, 60, 36, 255));
     }
     if name.contains("planks") {
-        return Some(RgbaColor::new(154, 118, 70, 255));
+        return Some(RgbaColor::new(126, 96, 56, 255));
     }
     if name.contains("stairs")
         || name.contains("slab")
@@ -1637,7 +1299,7 @@ fn category_block_color(name: &str) -> Option<RgbaColor> {
         || name.contains("barrel")
         || name.contains("bookshelf")
     {
-        return Some(RgbaColor::new(145, 105, 62, 255));
+        return Some(RgbaColor::new(118, 82, 48, 255));
     }
     if name.contains("flower")
         || name.contains("tulip")
@@ -1651,7 +1313,7 @@ fn category_block_color(name: &str) -> Option<RgbaColor> {
         || name.contains("petals")
         || name.contains("spore_blossom")
     {
-        return Some(RgbaColor::new(210, 120, 80, 255));
+        return Some(RgbaColor::new(178, 104, 78, 255));
     }
     if name.contains("grass")
         || name.contains("fern")
@@ -1674,13 +1336,13 @@ fn category_block_color(name: &str) -> Option<RgbaColor> {
         || name.contains("cactus")
         || name.contains("sugar_cane")
     {
-        return Some(RgbaColor::new(77, 140, 56, 255));
+        return Some(RgbaColor::new(58, 124, 46, 255));
     }
     if name.contains("hay") || name.contains("sponge") || name.contains("honey") {
-        return Some(RgbaColor::new(204, 164, 62, 255));
+        return Some(RgbaColor::new(180, 140, 48, 255));
     }
     if name.contains("mushroom") {
-        return Some(RgbaColor::new(150, 96, 76, 255));
+        return Some(RgbaColor::new(126, 78, 60, 255));
     }
     if name.contains("torch")
         || name.contains("lantern")
@@ -1689,37 +1351,34 @@ fn category_block_color(name: &str) -> Option<RgbaColor> {
         || name.contains("repeater")
         || name.contains("comparator")
     {
-        return Some(RgbaColor::new(168, 136, 84, 255));
+        return Some(RgbaColor::new(150, 112, 60, 255));
     }
     if name.contains("sand") || name.contains("beach") {
-        return Some(RgbaColor::new(214, 199, 140, 255));
+        return Some(RgbaColor::new(184, 168, 112, 255));
     }
     if name.contains("mud") || name.contains("dirt") || name.contains("path") {
-        return Some(RgbaColor::new(124, 90, 62, 255));
+        return Some(RgbaColor::new(104, 72, 50, 255));
     }
     if name.contains("terracotta") {
-        return Some(RgbaColor::new(145, 88, 63, 255));
+        return Some(RgbaColor::new(126, 70, 52, 255));
     }
     if name.contains("concrete") {
-        return Some(RgbaColor::new(136, 136, 136, 255));
+        return Some(RgbaColor::new(112, 113, 112, 255));
     }
     if name.contains("wool") || name.contains("carpet") {
-        return Some(RgbaColor::new(190, 190, 190, 255));
+        return Some(RgbaColor::new(164, 166, 164, 255));
     }
     if name.contains("glass") {
-        return Some(RgbaColor::new(180, 220, 235, 128));
+        return Some(RgbaColor::new(150, 194, 208, 128));
     }
     if name.contains("snow") {
-        return Some(RgbaColor::new(245, 250, 250, 255));
+        return Some(RgbaColor::new(222, 228, 224, 255));
     }
     if name.contains("ice") || name.contains("frosted") {
-        return Some(RgbaColor::new(145, 200, 245, 220));
-    }
-    if name.contains("water") {
-        return Some(RgbaColor::new(43, 92, 210, 190));
+        return Some(RgbaColor::new(112, 174, 214, 220));
     }
     if name.contains("lava") {
-        return Some(RgbaColor::new(255, 90, 0, 255));
+        return Some(RgbaColor::new(214, 72, 18, 255));
     }
     if name.contains("obsidian") {
         return Some(RgbaColor::new(25, 20, 36, 255));
@@ -1742,6 +1401,22 @@ fn multiply_with_biome_tint(
         multiply_channel(base.blue, tint.blue),
         255,
     )
+}
+
+fn blend_toward_color(base: RgbaColor, target: RgbaColor, target_weight: u16) -> RgbaColor {
+    let target_weight = target_weight.min(255);
+    let base_weight = 255_u16.saturating_sub(target_weight);
+    RgbaColor::new(
+        weighted_channel(base.red, target.red, base_weight, target_weight),
+        weighted_channel(base.green, target.green, base_weight, target_weight),
+        weighted_channel(base.blue, target.blue, base_weight, target_weight),
+        255,
+    )
+}
+
+fn weighted_channel(base: u8, target: u8, base_weight: u16, target_weight: u16) -> u8 {
+    let value = (u16::from(base) * base_weight + u16::from(target) * target_weight + 127) / 255;
+    u8_from_u16(value)
 }
 
 fn multiply_channel(base: u8, tint: u8) -> u8 {
@@ -1770,6 +1445,18 @@ fn alpha_blend(foreground: RgbaColor, background: RgbaColor) -> RgbaColor {
     )
 }
 
+fn shallow_water_alpha(depth: u8) -> u8 {
+    match depth {
+        0 | 1 => 40,
+        2 => 60,
+        3 => 66,
+        4 => 88,
+        5 => 110,
+        6 => 145,
+        _ => 180,
+    }
+}
+
 fn shade_color(color: RgbaColor, factor: i32) -> RgbaColor {
     RgbaColor::new(
         shade_channel(color.red, factor),
@@ -1787,15 +1474,6 @@ fn shade_channel(channel: u8, factor: i32) -> u8 {
         let value = i32::from(channel) * (100 + factor) / 100;
         u8_from_i32(value.clamp(0, 255))
     }
-}
-
-fn darken(color: RgbaColor, amount: u8) -> RgbaColor {
-    RgbaColor::new(
-        color.red.saturating_sub(amount),
-        color.green.saturating_sub(amount),
-        color.blue.saturating_sub(amount),
-        color.alpha,
-    )
 }
 
 fn lerp_color(start: RgbaColor, end: RgbaColor, numerator: i32, denominator: i32) -> RgbaColor {
@@ -1870,7 +1548,31 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_level_style_palette_json_imports() {
+    fn json_palette_imports_variant_colors() {
+        let mut palette = RenderPalette::default();
+        palette
+            .merge_json_str(
+                r##"{
+                    "blocks": {
+                        "minecraft:standing_banner": {
+                            "default": [255, 255, 255, 255],
+                            "variant_colors": {
+                                "banner_base_red": [160, 39, 34, 255]
+                            }
+                        }
+                    }
+                }"##,
+            )
+            .expect("variant colors should import");
+
+        assert_eq!(
+            palette.block_variant_color("minecraft:standing_banner", "banner_base_red"),
+            Some(RgbaColor::new(160, 39, 34, 255))
+        );
+    }
+
+    #[test]
+    fn legacy_object_map_palette_json_imports() {
         let mut palette = RenderPalette::default();
         let report = palette
             .merge_json_str(
@@ -1888,7 +1590,7 @@ mod tests {
                     }
                 }"#,
             )
-            .expect("bedrock-level style json should import");
+            .expect("legacy object-map style json should import");
 
         assert_eq!(report.block_colors, 0);
         assert_eq!(report.biome_colors, 1);
@@ -1904,7 +1606,7 @@ mod tests {
                     }
                 }"#,
             )
-            .expect("bedrock-level style block json should import");
+            .expect("legacy object-map style block json should import");
         assert_eq!(report.block_colors, 1);
         assert_eq!(
             block_palette.block_color("minecraft:sample_multi_texture"),
@@ -1985,6 +1687,9 @@ mod tests {
         assert_eq!(grass.alpha, 255);
         assert_eq!(leaves.alpha, 255);
         assert_eq!(water.alpha, 255);
+        assert_ne!(grass, RgbaColor::new(1, 2, 3, 255));
+        assert!(grass.green > grass.red);
+        assert!(grass.green > grass.blue);
         assert_ne!(
             grass,
             palette.surface_block_color("minecraft:grass_block", None, true)
@@ -2000,46 +1705,21 @@ mod tests {
     }
 
     #[test]
-    fn binary_palette_cache_roundtrips_without_json() {
-        let palette = RenderPalette::default()
-            .with_block_color("minecraft:cache_block", RgbaColor::new(1, 2, 3, 4))
-            .with_biome_color(901, RgbaColor::new(5, 6, 7, 8));
-        let bytes = palette
-            .to_binary_vec()
-            .expect("palette cache should encode");
-        let mut imported = RenderPalette::default();
-        let report = imported
-            .merge_binary_slice(&bytes)
-            .expect("palette cache should decode");
-
-        assert!(report.block_colors > 0);
-        assert!(report.biome_colors > 0);
-        assert_eq!(
-            imported.block_color("minecraft:cache_block"),
-            RgbaColor::new(1, 2, 3, 4)
-        );
-        assert_eq!(imported.biome_color(901), RgbaColor::new(5, 6, 7, 8));
-    }
-
-    #[test]
-    fn builtin_palette_cache_is_loaded_by_default() {
+    fn builtin_json_sources_are_loaded_by_default() {
         let palette = RenderPalette::default();
+        let json_palette = RenderPalette::from_builtin_json_sources()
+            .expect("built-in JSON palette sources should import");
         assert!(palette.block_colors.len() >= 1_200);
         assert!(palette.biome_colors.len() >= 88);
         assert!(palette.has_block_color("minecraft:farmland"));
         assert!(palette.has_block_color("minecraft:glow_lichen"));
         assert!(palette.has_block_color("minecraft:weeping_vines"));
+        assert_eq!(
+            palette.block_color("minecraft:farmland"),
+            json_palette.block_color("minecraft:farmland")
+        );
+        assert_eq!(palette.biome_color(0), json_palette.biome_color(0));
         assert_eq!(palette.block_color("minecraft:unknown_test").alpha, 255);
-    }
-
-    #[test]
-    fn builtin_json_sources_rebuild_embedded_palette_cache() {
-        let palette = RenderPalette::from_builtin_json_sources()
-            .expect("built-in JSON palette sources should import");
-        let bytes = palette
-            .to_binary_vec()
-            .expect("built-in JSON palette should encode");
-        assert_eq!(bytes, RenderPalette::builtin_palette_cache_bytes());
     }
 
     #[test]
@@ -2066,7 +1746,29 @@ mod tests {
     fn builtin_palette_sources_are_embedded() {
         assert!(RenderPalette::builtin_block_color_json().contains("grass"));
         assert!(RenderPalette::builtin_biome_color_json().contains("ocean"));
-        assert!(RenderPalette::builtin_palette_cache_bytes().starts_with(PALETTE_CACHE_MAGIC));
+    }
+
+    #[test]
+    fn builtin_palette_sources_do_not_use_tainted_source_markers() {
+        for source in [
+            RenderPalette::builtin_block_color_json(),
+            RenderPalette::builtin_biome_color_json(),
+        ] {
+            let lower = source.to_ascii_lowercase();
+            for marker in [
+                concat!("legacy", "-current"),
+                concat!("bedrock", "-level"),
+                "agpl",
+                concat!("wiki", "-icon-derived"),
+                concat!("wiki", "-color-values"),
+            ] {
+                assert!(
+                    !lower.contains(marker),
+                    "built-in palette source should not contain `{marker}`"
+                );
+            }
+            assert!(lower.contains("bedrock-render-clean-room-v1"));
+        }
     }
 
     #[test]
@@ -2104,6 +1806,202 @@ mod tests {
     }
 
     #[test]
+    fn resource_pack_variants_keep_material_family_colors() {
+        let palette = RenderPalette::default();
+        let oak_planks = palette.block_color("minecraft:oak_planks");
+        let oak_stairs = palette.block_color("minecraft:oak_stairs");
+        let oak_slab = palette.block_color("minecraft:oak_slab");
+        assert!(color_distance(oak_planks, oak_stairs) <= 35);
+        assert!(color_distance(oak_planks, oak_slab) <= 35);
+
+        let stone = palette.block_color("minecraft:stone");
+        let stone_stairs = palette.block_color("minecraft:stone_stairs");
+        let stone_slab = palette.block_color("minecraft:stone_slab");
+        assert!(color_distance(stone, stone_stairs) <= 80);
+        assert!(color_distance(stone, stone_slab) <= 120);
+
+        let farmland = palette.block_color("minecraft:farmland");
+        let dirt = palette.block_color("minecraft:dirt");
+        assert!(color_distance(farmland, dirt) >= 30);
+    }
+
+    #[test]
+    fn clean_room_bamboo_and_path_colors_are_semantic() {
+        let palette = RenderPalette::default();
+        let bamboo = palette.surface_block_color("minecraft:bamboo", Some(21), true);
+        assert!(bamboo.green > bamboo.red + 20);
+        assert!(bamboo.green > bamboo.blue + 30);
+        let plains_grass = palette.surface_block_color("minecraft:grass_block", Some(1), true);
+        let bamboo_material = palette.surface_block_color("minecraft:bamboo_block", Some(21), true);
+        assert!(color_distance(bamboo, plains_grass) >= 45);
+        assert!(color_distance(bamboo, bamboo_material) >= 120);
+
+        let path_without_tint = palette.surface_block_color("minecraft:grass_path", None, false);
+        let path_with_jungle_tint =
+            palette.surface_block_color("minecraft:grass_path", Some(21), true);
+        assert_eq!(path_without_tint, path_with_jungle_tint);
+        assert!(path_with_jungle_tint.red > path_with_jungle_tint.green);
+        assert!(path_with_jungle_tint.green > path_with_jungle_tint.blue);
+    }
+
+    #[test]
+    fn surface_grass_uses_grass_tint_and_stays_distinct() {
+        let palette = RenderPalette::default();
+        let plains = palette.surface_block_color("minecraft:grass_block", Some(1), true);
+        let desert = palette.surface_block_color("minecraft:grass_block", Some(2), true);
+        let jungle = palette.surface_block_color("minecraft:grass_block", Some(21), true);
+        let swamp = palette.surface_block_color("minecraft:grass_block", Some(6), true);
+        let cherry = palette.surface_block_color("minecraft:grass_block", Some(192), true);
+        let pale = palette.surface_block_color("minecraft:grass_block", Some(193), true);
+
+        for color in [plains, desert, jungle, swamp, cherry, pale] {
+            let brightness = luminance(color);
+            assert!(
+                (70..=205).contains(&brightness),
+                "{color:?} has unexpected brightness"
+            );
+        }
+        assert_ne!(plains, palette.biome_color(1));
+        assert_ne!(desert, palette.biome_color(2));
+        assert_ne!(jungle, palette.biome_color(21));
+        assert_ne!(swamp, palette.biome_color(6));
+        assert!(desert.red > desert.green && desert.green > desert.blue);
+        assert!(jungle.green > jungle.red && jungle.green > jungle.blue);
+        assert!(color_distance(plains, desert) >= 35);
+        assert!(color_distance(jungle, swamp) >= 35);
+        assert!(color_distance(cherry, pale) >= 25);
+
+        let default_tinted = palette.surface_block_color("minecraft:grass_block", None, false);
+        assert!(default_tinted.green > default_tinted.red);
+        assert!(default_tinted.green > default_tinted.blue);
+        assert!((70..=190).contains(&luminance(default_tinted)));
+    }
+
+    #[test]
+    fn grass_block_surface_uses_tint_without_recoloring_sand() {
+        let palette = RenderPalette::default();
+        for biome_id in [1, 16, 21] {
+            let grass = palette.surface_block_color("minecraft:grass_block", Some(biome_id), true);
+            let biome = palette.biome_color(biome_id);
+            assert_ne!(
+                grass, biome,
+                "grass should use grass tint, not biome viewport color"
+            );
+        }
+
+        let plains_sand = palette.surface_block_color("minecraft:sand", Some(1), true);
+        let jungle_sand = palette.surface_block_color("minecraft:sand", Some(21), true);
+        assert_eq!(plains_sand, jungle_sand);
+    }
+
+    #[test]
+    fn beach_grass_uses_grass_tint() {
+        let palette = RenderPalette::default();
+        let beach = palette.surface_block_color("minecraft:grass_block", Some(16), true);
+
+        assert_ne!(beach, palette.biome_color(16));
+        assert!(beach.green >= beach.red);
+        assert!(luminance(beach) >= 90);
+    }
+
+    #[test]
+    fn builtin_tint_masks_are_auditable_and_not_white() {
+        let value = serde_json::from_str::<Value>(RenderPalette::builtin_block_color_json())
+            .expect("built-in block palette JSON should parse");
+        let blocks = value
+            .get("blocks")
+            .and_then(Value::as_object)
+            .expect("built-in block palette should use wrapper schema");
+        for name in ["minecraft:grass_block", "minecraft:oak_leaves"] {
+            let entry = blocks
+                .get(name)
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{name} should have a block entry"));
+            assert_eq!(
+                entry
+                    .get("resource_pack_tint_source")
+                    .and_then(Value::as_str),
+                Some("texture_average")
+            );
+            let color = entry
+                .get("resource_pack_tint_mask")
+                .and_then(parse_color)
+                .unwrap_or_else(|| panic!("{name} should have a tint mask"));
+            let max_channel = color.red.max(color.green).max(color.blue);
+            assert!(
+                max_channel <= 220,
+                "{name} tint mask should not be near-white: {color:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn biome_water_tint_stays_blue_and_keeps_ocean_distinct() {
+        let palette = RenderPalette::default();
+        let ocean = palette.surface_block_color("minecraft:water", Some(0), true);
+        let deep_ocean = palette.surface_block_color("minecraft:water", Some(24), true);
+        let river = palette.surface_block_color("minecraft:water", Some(7), true);
+
+        for color in [ocean, deep_ocean, river] {
+            assert!(color.blue > color.green && color.green >= color.red);
+            assert!(luminance(color) <= 125, "{color:?} is too pale");
+        }
+        assert!(color_distance(ocean, river) >= 10);
+    }
+
+    #[test]
+    fn warm_ocean_water_preserves_cyan_biome_tint() {
+        let palette = RenderPalette::default();
+        let warm = palette.surface_block_color("minecraft:water", Some(40), true);
+        let lukewarm = palette.surface_block_color("minecraft:water", Some(42), true);
+
+        assert!(
+            warm.green >= 130 && warm.blue >= 190 && warm.red <= 25,
+            "{warm:?} should keep warm ocean cyan"
+        );
+        assert!(
+            lukewarm.green >= 105 && lukewarm.blue >= 180 && lukewarm.red <= 35,
+            "{lukewarm:?} should keep lukewarm ocean blue-cyan"
+        );
+        assert!(color_distance(warm, lukewarm) >= 20);
+    }
+
+    #[test]
+    fn shallow_transparent_water_keeps_visible_cyan_signal() {
+        let palette = RenderPalette::default();
+        let sand = palette.surface_block_color("minecraft:sand", Some(7), true);
+        let shallow = palette.transparent_water_color(
+            "minecraft:water",
+            Some("minecraft:sand"),
+            Some(7),
+            1,
+            true,
+        );
+        let two_deep = palette.transparent_water_color(
+            "minecraft:water",
+            Some("minecraft:sand"),
+            Some(7),
+            2,
+            true,
+        );
+
+        assert!(shallow.blue > sand.blue, "{shallow:?} over {sand:?}");
+        assert!(two_deep.blue >= shallow.blue);
+        assert!(color_distance(shallow, sand) <= 70);
+        assert!(color_distance(two_deep, sand) <= 95);
+        assert!(color_distance(shallow, sand) < color_distance(two_deep, sand));
+        assert!(color_distance(two_deep, shallow) >= 4);
+    }
+
+    #[test]
+    fn leaf_litter_is_not_foliage_tinted() {
+        let palette = RenderPalette::default();
+        let base = palette.block_color("minecraft:leaf_litter");
+        let tinted = palette.surface_block_color("minecraft:leaf_litter", Some(21), true);
+        assert_eq!(with_alpha(base, 255), tinted);
+    }
+
+    #[test]
     fn height_shading_preserves_alpha_and_changes_brightness() {
         let palette = RenderPalette::default();
         let base = RgbaColor::new(100, 120, 140, 200);
@@ -2114,5 +2012,15 @@ mod tests {
         assert_eq!(darker.alpha, 200);
         assert!(brighter.red > base.red);
         assert!(darker.red < base.red);
+    }
+
+    fn luminance(color: RgbaColor) -> u16 {
+        (u16::from(color.red) * 30 + u16::from(color.green) * 59 + u16::from(color.blue) * 11) / 100
+    }
+
+    fn color_distance(left: RgbaColor, right: RgbaColor) -> u16 {
+        u16::from(left.red.abs_diff(right.red))
+            + u16::from(left.green.abs_diff(right.green))
+            + u16::from(left.blue.abs_diff(right.blue))
     }
 }

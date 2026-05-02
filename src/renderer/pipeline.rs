@@ -1,9 +1,10 @@
 use crate::error::{BedrockRenderError, Result};
 use crate::palette::{RenderPalette, RgbaColor};
 use bedrock_world::{
-    BedrockWorld, BlockPos, ChunkPos, Dimension, RenderChunkData, RenderChunkLoadOptions,
+    BedrockWorld, BlockPos, BlockState, CancelFlag as WorldCancelFlag, ChunkPos, Dimension, NbtTag,
+    RenderBlockEntity, RenderChunkData, RenderChunkLoadOptions, RenderChunkPriority,
     RenderChunkRegion, RenderRegionLoadOptions, RenderSurfaceSubchunkMode, SubChunk,
-    SubChunkDecodeMode,
+    SubChunkDecodeMode, WorldPipelineOptions, WorldScanOptions, WorldThreadingOptions,
 };
 #[cfg(feature = "png")]
 use image::codecs::png::PngEncoder;
@@ -11,6 +12,7 @@ use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
 #[cfg(any(feature = "png", feature = "webp"))]
 use image::{ExtendedColorType, ImageEncoder};
+use rayon::ThreadPoolBuilder;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -24,9 +26,9 @@ use std::thread;
 use std::time::Instant;
 
 /// Renderer cache schema version used in tile cache keys.
-pub const RENDERER_CACHE_VERSION: u32 = 3;
+pub const RENDERER_CACHE_VERSION: u32 = 15;
 /// Default embedded palette version used in tile cache keys.
-pub const DEFAULT_PALETTE_VERSION: u32 = 1;
+pub const DEFAULT_PALETTE_VERSION: u32 = 14;
 /// Maximum fixed worker thread count accepted by render options.
 pub const MAX_RENDER_THREADS: usize = 512;
 /// Maximum width or height of a rendered tile in pixels.
@@ -39,7 +41,7 @@ const MAX_AUTO_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MISSING_HEIGHT: i16 = i16::MIN;
 const GPU_COMPOSE_MIN_PIXELS: usize = 256 * 256;
 /// GPU terrain-lighting shader version used in cache signatures.
-pub const GPU_COMPOSE_SHADER_VERSION: u32 = 1;
+pub const GPU_COMPOSE_SHADER_VERSION: u32 = 2;
 
 /// Tile coordinate in chunk-tile space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -280,11 +282,35 @@ struct RegionBakeKey {
     mode: RenderMode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ChunkBakeKey {
+    pos: ChunkPos,
+    mode: RenderMode,
+}
+
+struct TileComposeTask {
+    tile_index: usize,
+    job: RenderJob,
+    bakes: BTreeMap<ChunkPos, ChunkBake>,
+    diagnostics: RenderDiagnostics,
+}
+
+struct TileComposeResult {
+    tile_index: usize,
+    tile: TileImage,
+}
+
 #[derive(Debug, Clone)]
 struct RegionPlan {
     key: RegionBakeKey,
     region: ChunkRegion,
     chunk_positions: Vec<ChunkPos>,
+}
+
+struct RegionWaveRenderResult {
+    rendered_tiles: BTreeSet<usize>,
+    diagnostics: RenderDiagnostics,
+    stats: RenderPipelineStats,
 }
 
 impl ChunkRegion {
@@ -369,6 +395,12 @@ pub struct RenderOptions {
     pub quality: u8,
     /// Requested CPU/GPU backend.
     pub backend: RenderBackend,
+    /// GPU scheduling and batching policy.
+    pub gpu: RenderGpuOptions,
+    /// CPU pipeline scheduling policy.
+    pub cpu: RenderCpuPipelineOptions,
+    /// Tile scheduling priority.
+    pub priority: RenderTilePriority,
     /// Worker-thread policy.
     pub threading: RenderThreadingOptions,
     /// Execution profile used for automatic thread and memory budgets.
@@ -397,6 +429,9 @@ impl Default for RenderOptions {
             format: ImageFormat::WebP,
             quality: 90,
             backend: RenderBackend::Auto,
+            gpu: RenderGpuOptions::default(),
+            cpu: RenderCpuPipelineOptions::default(),
+            priority: RenderTilePriority::RowMajor,
             threading: RenderThreadingOptions::Auto,
             execution_profile: RenderExecutionProfile::Export,
             memory_budget: RenderMemoryBudget::Auto,
@@ -411,6 +446,51 @@ impl Default for RenderOptions {
     }
 }
 
+/// CPU load/bake/compose pipeline policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderCpuPipelineOptions {
+    /// Queue depth for bounded CPU pipeline channels; zero chooses automatically.
+    pub queue_depth: usize,
+    /// Number of chunks assigned to one load/bake batch; zero chooses automatically.
+    pub chunk_batch_size: usize,
+    /// Number of worker threads reserved for encode/write work; zero chooses automatically.
+    pub encode_workers: usize,
+}
+
+impl RenderCpuPipelineOptions {
+    fn resolve_queue_depth(self, workers: usize, work_items: usize) -> usize {
+        self.queue_depth
+            .max(if self.queue_depth == 0 {
+                workers
+                    .max(1)
+                    .saturating_mul(2)
+                    .max(work_items.min(128).max(1))
+            } else {
+                1
+            })
+            .max(1)
+    }
+
+    fn to_world_pipeline(self) -> WorldPipelineOptions {
+        WorldPipelineOptions {
+            queue_depth: self.queue_depth,
+            chunk_batch_size: self.chunk_batch_size,
+            subchunk_decode_workers: 0,
+            progress_interval: 0,
+        }
+    }
+}
+
+/// Tile scheduling priority for interactive and export pipelines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RenderTilePriority {
+    /// Stable tile x/z order.
+    #[default]
+    RowMajor,
+    /// Render tiles closest to the supplied tile coordinate first.
+    DistanceFrom { tile_x: i32, tile_z: i32 },
+}
+
 /// Requested render backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum RenderBackend {
@@ -421,6 +501,127 @@ pub enum RenderBackend {
     Gpu,
     /// Force CPU composition.
     Cpu,
+}
+
+/// GPU compose scheduling options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderGpuOptions {
+    /// Minimum tile pixel count before `RenderBackend::Auto` tries GPU compose.
+    pub min_pixels: usize,
+    /// Maximum number of in-flight GPU jobs; zero chooses a profile-aware default.
+    pub max_in_flight: usize,
+    /// Number of tiles submitted as one scheduling batch; zero chooses automatically.
+    pub batch_size: usize,
+    /// Number of CPU readback workers; zero chooses automatically.
+    pub readback_workers: usize,
+    /// Target number of pixels in one GPU submit batch; zero chooses automatically.
+    pub batch_pixels: usize,
+    /// Number of CPU submit workers feeding the GPU queue; zero chooses automatically.
+    pub submit_workers: usize,
+    /// Approximate reusable GPU storage buffer pool budget in bytes; zero chooses automatically.
+    pub buffer_pool_bytes: usize,
+    /// Approximate reusable GPU staging buffer pool budget in bytes; zero chooses automatically.
+    pub staging_pool_bytes: usize,
+}
+
+impl Default for RenderGpuOptions {
+    fn default() -> Self {
+        Self {
+            min_pixels: GPU_COMPOSE_MIN_PIXELS,
+            max_in_flight: 0,
+            batch_size: 0,
+            readback_workers: 0,
+            batch_pixels: 0,
+            submit_workers: 0,
+            buffer_pool_bytes: 0,
+            staging_pool_bytes: 0,
+        }
+    }
+}
+
+impl RenderGpuOptions {
+    fn resolve_max_in_flight(self, profile: RenderExecutionProfile, work_items: usize) -> usize {
+        if work_items == 0 {
+            return 0;
+        }
+        let automatic = match profile {
+            RenderExecutionProfile::Export => 4,
+            RenderExecutionProfile::Interactive => 2,
+        };
+        self.max_in_flight
+            .max(if self.max_in_flight == 0 {
+                automatic
+            } else {
+                1
+            })
+            .min(work_items)
+            .max(1)
+    }
+
+    fn resolve_batch_size(self, max_in_flight: usize, work_items: usize) -> usize {
+        if work_items == 0 {
+            return 0;
+        }
+        let automatic = max_in_flight.max(1);
+        self.batch_size
+            .max(if self.batch_size == 0 { automatic } else { 1 })
+            .min(work_items)
+            .max(1)
+    }
+
+    fn resolve_readback_workers(self, max_in_flight: usize) -> usize {
+        self.readback_workers
+            .max(if self.readback_workers == 0 {
+                max_in_flight
+            } else {
+                1
+            })
+            .max(1)
+    }
+
+    fn resolve_submit_workers(self, max_in_flight: usize) -> usize {
+        self.submit_workers
+            .max(if self.submit_workers == 0 {
+                max_in_flight
+            } else {
+                1
+            })
+            .max(1)
+    }
+
+    fn resolve_batch_pixels(self, profile: RenderExecutionProfile) -> usize {
+        self.batch_pixels.max(if self.batch_pixels == 0 {
+            match profile {
+                RenderExecutionProfile::Interactive => 512 * 512,
+                RenderExecutionProfile::Export => 1024 * 1024,
+            }
+        } else {
+            1
+        })
+    }
+
+    fn resolve_buffer_pool_bytes(self, profile: RenderExecutionProfile) -> usize {
+        self.buffer_pool_bytes.max(if self.buffer_pool_bytes == 0 {
+            match profile {
+                RenderExecutionProfile::Interactive => 64 * 1024 * 1024,
+                RenderExecutionProfile::Export => 256 * 1024 * 1024,
+            }
+        } else {
+            1
+        })
+    }
+
+    fn resolve_staging_pool_bytes(self, profile: RenderExecutionProfile) -> usize {
+        self.staging_pool_bytes
+            .max(if self.staging_pool_bytes == 0 {
+                match profile {
+                    RenderExecutionProfile::Interactive => 64 * 1024 * 1024,
+                    RenderExecutionProfile::Export => 256 * 1024 * 1024,
+                }
+            } else {
+                1
+            })
+    }
 }
 
 impl RenderBackend {
@@ -579,6 +780,8 @@ pub struct RenderPipelineStats {
     pub worker_idle_ms: u128,
     /// Aggregate queue wait time, in milliseconds.
     pub queue_wait_ms: u128,
+    /// Queue wait time in CPU load/bake/compose stages, in milliseconds.
+    pub cpu_queue_wait_ms: u128,
     /// Peak region cache memory, in bytes.
     pub peak_cache_bytes: usize,
     /// Peak active task count.
@@ -599,6 +802,30 @@ pub struct RenderPipelineStats {
     pub gpu_dispatch_ms: u128,
     /// Time spent reading GPU output, in milliseconds.
     pub gpu_readback_ms: u128,
+    /// Number of GPU scheduling batches submitted.
+    pub gpu_batches: usize,
+    /// Number of tiles included in GPU batches.
+    pub gpu_batch_tiles: usize,
+    /// Peak number of in-flight GPU jobs.
+    pub gpu_max_in_flight: usize,
+    /// Time spent waiting on the GPU queue, in milliseconds.
+    pub gpu_queue_wait_ms: u128,
+    /// Number of CPU workers used for GPU readback.
+    pub gpu_worker_threads: usize,
+    /// Number of CPU workers used to submit GPU work.
+    pub gpu_submit_workers: usize,
+    /// Number of GPU storage buffer pool hits.
+    pub gpu_buffer_reuses: usize,
+    /// Number of GPU storage buffer allocations.
+    pub gpu_buffer_allocations: usize,
+    /// Number of GPU storage buffer evictions.
+    pub gpu_buffer_evictions: usize,
+    /// Number of GPU staging buffer pool hits.
+    pub gpu_staging_reuses: usize,
+    /// Number of GPU staging buffer allocations.
+    pub gpu_staging_allocations: usize,
+    /// Number of GPU staging buffer evictions.
+    pub gpu_staging_evictions: usize,
     /// Name of the GPU adapter used, if any.
     pub gpu_adapter_name: Option<String>,
     /// Last GPU fallback reason, if any.
@@ -696,16 +923,16 @@ impl TerrainLightingOptions {
             enabled: true,
             light_azimuth_degrees: 315.0,
             light_elevation_degrees: 45.0,
-            normal_strength: 1.25,
-            shadow_strength: 0.42,
-            highlight_strength: 0.28,
-            ambient_occlusion: 0.04,
-            max_shadow: 38.0,
-            land_slope_softness: 6.0,
-            edge_relief_strength: 0.18,
-            edge_relief_threshold: 3.0,
-            edge_relief_max_shadow: 18.0,
-            edge_relief_highlight: 0.10,
+            normal_strength: 1.55,
+            shadow_strength: 0.48,
+            highlight_strength: 0.34,
+            ambient_occlusion: 0.055,
+            max_shadow: 42.0,
+            land_slope_softness: 7.0,
+            edge_relief_strength: 0.24,
+            edge_relief_threshold: 2.0,
+            edge_relief_max_shadow: 20.0,
+            edge_relief_highlight: 0.12,
             underwater_relief_enabled: true,
             underwater_relief_strength: 0.75,
             underwater_depth_fade: 8.0,
@@ -751,6 +978,59 @@ impl TerrainLightingOptions {
 impl Default for TerrainLightingOptions {
     fn default() -> Self {
         Self::soft()
+    }
+}
+
+/// Per-block 2D boundary and contact-shadow options for surface rendering.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockBoundaryRenderOptions {
+    /// Whether per-block boundary shading is enabled.
+    pub enabled: bool,
+    /// Overall boundary shadow strength.
+    pub strength: f32,
+    /// Subtle line strength used on flat terrain.
+    pub flat_strength: f32,
+    /// Minimum height difference before height-contact emphasis is applied.
+    pub height_threshold: f32,
+    /// Maximum boundary shadow percentage.
+    pub max_shadow: f32,
+    /// Boundary highlight multiplier.
+    pub highlight_strength: f32,
+    /// Softness used to compress large height differences.
+    pub softness: f32,
+    /// Width of the boundary line in output pixels.
+    pub line_width_pixels: f32,
+}
+
+impl BlockBoundaryRenderOptions {
+    /// Returns disabled block-boundary rendering.
+    #[must_use]
+    pub const fn off() -> Self {
+        Self {
+            enabled: false,
+            strength: 0.0,
+            flat_strength: 0.0,
+            height_threshold: 1.0,
+            max_shadow: 0.0,
+            highlight_strength: 0.0,
+            softness: 1.0,
+            line_width_pixels: 1.0,
+        }
+    }
+}
+
+impl Default for BlockBoundaryRenderOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strength: 0.34,
+            flat_strength: 0.08,
+            height_threshold: 1.0,
+            max_shadow: 14.0,
+            highlight_strength: 0.08,
+            softness: 6.0,
+            line_width_pixels: 1.0,
+        }
     }
 }
 
@@ -815,12 +1095,65 @@ impl TerrainHeightNeighborhood {
             highlight: if pit_edge { amount * 0.25 } else { amount },
         }
     }
+
+    fn block_boundary_relief(self, threshold: f32, softness: f32) -> TerrainEdgeRelief {
+        let threshold = threshold.max(0.0);
+        let softness = softness.max(0.001);
+        let center = f32::from(self.center);
+        let mut higher_neighbor_delta = 0.0_f32;
+        let mut lower_neighbor_delta = 0.0_f32;
+        for neighbor in [
+            self.north_west,
+            self.north,
+            self.north_east,
+            self.west,
+            self.east,
+            self.south_west,
+            self.south,
+            self.south_east,
+        ] {
+            let delta = f32::from(neighbor) - center;
+            higher_neighbor_delta = higher_neighbor_delta.max(delta);
+            lower_neighbor_delta = lower_neighbor_delta.max(-delta);
+        }
+
+        let max_delta = higher_neighbor_delta.max(lower_neighbor_delta);
+        if max_delta <= threshold {
+            return TerrainEdgeRelief::default();
+        }
+        let delta = max_delta - threshold;
+        let amount = (delta / (delta + softness)).clamp(0.0, 1.0);
+        let pit_edge = higher_neighbor_delta >= lower_neighbor_delta;
+        TerrainEdgeRelief {
+            shadow: if pit_edge { amount } else { amount * 0.45 },
+            highlight: if pit_edge { amount * 0.25 } else { amount },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct TerrainEdgeRelief {
     shadow: f32,
     highlight: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockBoundaryContext {
+    pixel_x: u32,
+    pixel_z: u32,
+    pixels_per_block: u32,
+    blocks_per_pixel: u32,
+}
+
+impl BlockBoundaryContext {
+    const fn new(job: &RenderJob, pixel_x: u32, pixel_z: u32) -> Self {
+        Self {
+            pixel_x,
+            pixel_z,
+            pixels_per_block: job.pixels_per_block,
+            blocks_per_pixel: job.scale,
+        }
+    }
 }
 
 /// Options that affect surface block rendering.
@@ -835,6 +1168,8 @@ pub struct SurfaceRenderOptions {
     pub height_shading: bool,
     /// Terrain lighting options.
     pub lighting: TerrainLightingOptions,
+    /// Per-block 2D boundary and height-contact shadow options.
+    pub block_boundaries: BlockBoundaryRenderOptions,
     /// Skip air blocks while searching for a surface block.
     pub skip_air: bool,
     /// Draw unknown blocks with the diagnostic unknown-block color.
@@ -848,6 +1183,7 @@ impl Default for SurfaceRenderOptions {
             biome_tint: true,
             height_shading: true,
             lighting: TerrainLightingOptions::default(),
+            block_boundaries: BlockBoundaryRenderOptions::default(),
             skip_air: true,
             render_unknown_blocks: true,
         }
@@ -1281,14 +1617,25 @@ pub struct RegionBake {
 }
 
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+#[allow(dead_code)]
 pub(super) struct GpuTileComposeInput<'a> {
     pub width: u32,
     pub height: u32,
+    pub pixels_per_block: u32,
+    pub blocks_per_pixel: u32,
     pub colors: &'a [u32],
     pub heights: &'a [i32],
     pub water_depths: &'a [u32],
     pub lighting_enabled: bool,
     pub lighting: TerrainLightingOptions,
+    pub block_boundaries: BlockBoundaryRenderOptions,
+    pub max_in_flight: usize,
+    pub batch_size: usize,
+    pub readback_workers: usize,
+    pub submit_workers: usize,
+    pub batch_pixels: usize,
+    pub buffer_pool_bytes: usize,
+    pub staging_pool_bytes: usize,
 }
 
 pub(super) struct GpuTileComposeOutput {
@@ -1296,6 +1643,18 @@ pub(super) struct GpuTileComposeOutput {
     pub upload_ms: u128,
     pub dispatch_ms: u128,
     pub readback_ms: u128,
+    pub queue_wait_ms: u128,
+    pub batches: usize,
+    pub batch_tiles: usize,
+    pub max_in_flight: usize,
+    pub worker_threads: usize,
+    pub submit_workers: usize,
+    pub buffer_reuses: usize,
+    pub buffer_allocations: usize,
+    pub buffer_evictions: usize,
+    pub staging_reuses: usize,
+    pub staging_allocations: usize,
+    pub staging_evictions: usize,
     pub adapter_name: String,
 }
 
@@ -1308,6 +1667,18 @@ struct TileComposeStats {
     gpu_upload_ms: u128,
     gpu_dispatch_ms: u128,
     gpu_readback_ms: u128,
+    gpu_batches: usize,
+    gpu_batch_tiles: usize,
+    gpu_max_in_flight: usize,
+    gpu_queue_wait_ms: u128,
+    gpu_worker_threads: usize,
+    gpu_submit_workers: usize,
+    gpu_buffer_reuses: usize,
+    gpu_buffer_allocations: usize,
+    gpu_buffer_evictions: usize,
+    gpu_staging_reuses: usize,
+    gpu_staging_allocations: usize,
+    gpu_staging_evictions: usize,
     gpu_adapter_name: Option<String>,
     gpu_fallback_reason: Option<String>,
 }
@@ -1346,6 +1717,18 @@ impl TileComposeStats {
             gpu_upload_ms: output.upload_ms,
             gpu_dispatch_ms: output.dispatch_ms,
             gpu_readback_ms: output.readback_ms,
+            gpu_batches: output.batches,
+            gpu_batch_tiles: output.batch_tiles,
+            gpu_max_in_flight: output.max_in_flight,
+            gpu_queue_wait_ms: output.queue_wait_ms,
+            gpu_worker_threads: output.worker_threads,
+            gpu_submit_workers: output.submit_workers,
+            gpu_buffer_reuses: output.buffer_reuses,
+            gpu_buffer_allocations: output.buffer_allocations,
+            gpu_buffer_evictions: output.buffer_evictions,
+            gpu_staging_reuses: output.staging_reuses,
+            gpu_staging_allocations: output.staging_allocations,
+            gpu_staging_evictions: output.staging_evictions,
             gpu_adapter_name: Some(output.adapter_name.clone()),
             ..Self::default()
         }
@@ -1363,6 +1746,32 @@ impl TileComposeStats {
         self.gpu_upload_ms = self.gpu_upload_ms.saturating_add(other.gpu_upload_ms);
         self.gpu_dispatch_ms = self.gpu_dispatch_ms.saturating_add(other.gpu_dispatch_ms);
         self.gpu_readback_ms = self.gpu_readback_ms.saturating_add(other.gpu_readback_ms);
+        self.gpu_batches = self.gpu_batches.saturating_add(other.gpu_batches);
+        self.gpu_batch_tiles = self.gpu_batch_tiles.saturating_add(other.gpu_batch_tiles);
+        self.gpu_max_in_flight = self.gpu_max_in_flight.max(other.gpu_max_in_flight);
+        self.gpu_queue_wait_ms = self
+            .gpu_queue_wait_ms
+            .saturating_add(other.gpu_queue_wait_ms);
+        self.gpu_worker_threads = self.gpu_worker_threads.max(other.gpu_worker_threads);
+        self.gpu_submit_workers = self.gpu_submit_workers.max(other.gpu_submit_workers);
+        self.gpu_buffer_reuses = self
+            .gpu_buffer_reuses
+            .saturating_add(other.gpu_buffer_reuses);
+        self.gpu_buffer_allocations = self
+            .gpu_buffer_allocations
+            .saturating_add(other.gpu_buffer_allocations);
+        self.gpu_buffer_evictions = self
+            .gpu_buffer_evictions
+            .saturating_add(other.gpu_buffer_evictions);
+        self.gpu_staging_reuses = self
+            .gpu_staging_reuses
+            .saturating_add(other.gpu_staging_reuses);
+        self.gpu_staging_allocations = self
+            .gpu_staging_allocations
+            .saturating_add(other.gpu_staging_allocations);
+        self.gpu_staging_evictions = self
+            .gpu_staging_evictions
+            .saturating_add(other.gpu_staging_evictions);
         if self.gpu_adapter_name.is_none() {
             self.gpu_adapter_name = other.gpu_adapter_name;
         }
@@ -1403,6 +1812,107 @@ impl RenderPipelineStats {
         self.gpu_upload_ms = self.gpu_upload_ms.saturating_add(stats.gpu_upload_ms);
         self.gpu_dispatch_ms = self.gpu_dispatch_ms.saturating_add(stats.gpu_dispatch_ms);
         self.gpu_readback_ms = self.gpu_readback_ms.saturating_add(stats.gpu_readback_ms);
+        self.gpu_batches = self.gpu_batches.saturating_add(stats.gpu_batches);
+        self.gpu_batch_tiles = self.gpu_batch_tiles.saturating_add(stats.gpu_batch_tiles);
+        self.gpu_max_in_flight = self.gpu_max_in_flight.max(stats.gpu_max_in_flight);
+        self.gpu_queue_wait_ms = self
+            .gpu_queue_wait_ms
+            .saturating_add(stats.gpu_queue_wait_ms);
+        self.gpu_worker_threads = self.gpu_worker_threads.max(stats.gpu_worker_threads);
+        self.gpu_submit_workers = self.gpu_submit_workers.max(stats.gpu_submit_workers);
+        self.gpu_buffer_reuses = self
+            .gpu_buffer_reuses
+            .saturating_add(stats.gpu_buffer_reuses);
+        self.gpu_buffer_allocations = self
+            .gpu_buffer_allocations
+            .saturating_add(stats.gpu_buffer_allocations);
+        self.gpu_buffer_evictions = self
+            .gpu_buffer_evictions
+            .saturating_add(stats.gpu_buffer_evictions);
+        self.gpu_staging_reuses = self
+            .gpu_staging_reuses
+            .saturating_add(stats.gpu_staging_reuses);
+        self.gpu_staging_allocations = self
+            .gpu_staging_allocations
+            .saturating_add(stats.gpu_staging_allocations);
+        self.gpu_staging_evictions = self
+            .gpu_staging_evictions
+            .saturating_add(stats.gpu_staging_evictions);
+        if self.gpu_adapter_name.is_none() {
+            self.gpu_adapter_name = stats.gpu_adapter_name;
+        }
+        if self.gpu_fallback_reason.is_none() {
+            self.gpu_fallback_reason = stats.gpu_fallback_reason;
+        }
+    }
+
+    fn add_pipeline_stats(&mut self, stats: Self) {
+        self.planned_tiles = self.planned_tiles.saturating_add(stats.planned_tiles);
+        self.planned_regions = self.planned_regions.saturating_add(stats.planned_regions);
+        self.unique_chunks = self.unique_chunks.saturating_add(stats.unique_chunks);
+        self.baked_chunks = self.baked_chunks.saturating_add(stats.baked_chunks);
+        self.baked_regions = self.baked_regions.saturating_add(stats.baked_regions);
+        self.cache_hits = self.cache_hits.saturating_add(stats.cache_hits);
+        self.cache_misses = self.cache_misses.saturating_add(stats.cache_misses);
+        self.region_cache_hits = self
+            .region_cache_hits
+            .saturating_add(stats.region_cache_hits);
+        self.region_cache_misses = self
+            .region_cache_misses
+            .saturating_add(stats.region_cache_misses);
+        self.bake_ms = self.bake_ms.saturating_add(stats.bake_ms);
+        self.region_bake_ms = self.region_bake_ms.saturating_add(stats.region_bake_ms);
+        self.tile_compose_ms = self.tile_compose_ms.saturating_add(stats.tile_compose_ms);
+        self.encode_ms = self.encode_ms.saturating_add(stats.encode_ms);
+        self.write_ms = self.write_ms.saturating_add(stats.write_ms);
+        self.worker_idle_ms = self.worker_idle_ms.saturating_add(stats.worker_idle_ms);
+        self.queue_wait_ms = self.queue_wait_ms.saturating_add(stats.queue_wait_ms);
+        self.cpu_queue_wait_ms = self
+            .cpu_queue_wait_ms
+            .saturating_add(stats.cpu_queue_wait_ms);
+        self.peak_cache_bytes = self.peak_cache_bytes.max(stats.peak_cache_bytes);
+        self.active_tasks_peak = self.active_tasks_peak.max(stats.active_tasks_peak);
+        self.peak_worker_threads = self.peak_worker_threads.max(stats.peak_worker_threads);
+        if stats.gpu_tiles != 0 || stats.cpu_tiles != 0 || stats.gpu_fallbacks != 0 {
+            if self.gpu_tiles == 0 && self.cpu_tiles == 0 && self.gpu_fallbacks == 0 {
+                self.resolved_backend = stats.resolved_backend;
+            } else {
+                self.resolved_backend =
+                    merge_backends(self.resolved_backend, stats.resolved_backend);
+            }
+        }
+        self.gpu_tiles = self.gpu_tiles.saturating_add(stats.gpu_tiles);
+        self.cpu_tiles = self.cpu_tiles.saturating_add(stats.cpu_tiles);
+        self.gpu_fallbacks = self.gpu_fallbacks.saturating_add(stats.gpu_fallbacks);
+        self.gpu_upload_ms = self.gpu_upload_ms.saturating_add(stats.gpu_upload_ms);
+        self.gpu_dispatch_ms = self.gpu_dispatch_ms.saturating_add(stats.gpu_dispatch_ms);
+        self.gpu_readback_ms = self.gpu_readback_ms.saturating_add(stats.gpu_readback_ms);
+        self.gpu_batches = self.gpu_batches.saturating_add(stats.gpu_batches);
+        self.gpu_batch_tiles = self.gpu_batch_tiles.saturating_add(stats.gpu_batch_tiles);
+        self.gpu_max_in_flight = self.gpu_max_in_flight.max(stats.gpu_max_in_flight);
+        self.gpu_queue_wait_ms = self
+            .gpu_queue_wait_ms
+            .saturating_add(stats.gpu_queue_wait_ms);
+        self.gpu_worker_threads = self.gpu_worker_threads.max(stats.gpu_worker_threads);
+        self.gpu_submit_workers = self.gpu_submit_workers.max(stats.gpu_submit_workers);
+        self.gpu_buffer_reuses = self
+            .gpu_buffer_reuses
+            .saturating_add(stats.gpu_buffer_reuses);
+        self.gpu_buffer_allocations = self
+            .gpu_buffer_allocations
+            .saturating_add(stats.gpu_buffer_allocations);
+        self.gpu_buffer_evictions = self
+            .gpu_buffer_evictions
+            .saturating_add(stats.gpu_buffer_evictions);
+        self.gpu_staging_reuses = self
+            .gpu_staging_reuses
+            .saturating_add(stats.gpu_staging_reuses);
+        self.gpu_staging_allocations = self
+            .gpu_staging_allocations
+            .saturating_add(stats.gpu_staging_allocations);
+        self.gpu_staging_evictions = self
+            .gpu_staging_evictions
+            .saturating_add(stats.gpu_staging_evictions);
         if self.gpu_adapter_name.is_none() {
             self.gpu_adapter_name = stats.gpu_adapter_name;
         }
@@ -1570,7 +2080,7 @@ pub struct TileCacheKey {
     pub world_signature: String,
     /// Renderer cache schema version.
     pub renderer_version: u32,
-    /// Palette cache schema version.
+    /// Palette data version.
     pub palette_version: u32,
     /// Bedrock dimension.
     pub dimension: Dimension,
@@ -1598,6 +2108,13 @@ pub struct TileCache {
     memory_order: VecDeque<TileCacheKey>,
     memory: BTreeMap<TileCacheKey, TileImage>,
 }
+
+struct TileCacheWrite {
+    key: TileCacheKey,
+    encoded: Vec<u8>,
+}
+
+type TileCacheWriteSender = Arc<Mutex<mpsc::Sender<TileCacheWrite>>>;
 
 impl TileCache {
     /// Creates a tile cache rooted at a filesystem path.
@@ -1684,6 +2201,441 @@ impl TileCache {
     }
 }
 
+fn spawn_tile_cache_writer(cache: Arc<Mutex<TileCache>>) -> Option<TileCacheWriteSender> {
+    let (sender, receiver) = mpsc::channel::<TileCacheWrite>();
+    match thread::Builder::new()
+        .name("bedrock-render-tile-cache-writer".to_string())
+        .spawn(move || {
+            for write in receiver {
+                let cache = match cache.lock() {
+                    Ok(cache) => cache,
+                    Err(_) => {
+                        log::warn!("tile cache lock was poisoned while writing asynchronously");
+                        continue;
+                    }
+                };
+                if let Err(error) = cache.write_encoded(&write.key, &write.encoded) {
+                    log::warn!("failed to write rendered tile cache asynchronously: {error}");
+                }
+            }
+        }) {
+        Ok(_handle) => Some(Arc::new(Mutex::new(sender))),
+        Err(error) => {
+            log::warn!("failed to start rendered tile cache writer: {error}");
+            None
+        }
+    }
+}
+
+fn queue_tile_cache_write(writer: &Option<TileCacheWriteSender>, write: TileCacheWrite) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let sender = match writer.lock() {
+        Ok(sender) => sender,
+        Err(_) => {
+            log::warn!("tile cache writer sender lock was poisoned");
+            return;
+        }
+    };
+    if let Err(error) = sender.send(write) {
+        log::warn!("failed to queue rendered tile cache write: {error}");
+    }
+}
+
+fn render_tile_stream_group_size(profile: RenderExecutionProfile, tile_count: usize) -> usize {
+    if profile == RenderExecutionProfile::Interactive {
+        1
+    } else {
+        tile_count.max(1)
+    }
+}
+
+/// Configuration for a reusable map render session.
+#[derive(Debug, Clone)]
+pub struct MapRenderSessionConfig {
+    /// Root directory used for encoded tile cache files.
+    pub cache_root: PathBuf,
+    /// Maximum number of decoded tiles retained by the in-memory cache.
+    pub tile_cache_memory_limit: usize,
+    /// Stable world identifier used in cache paths.
+    pub world_id: String,
+    /// World content signature used to isolate incompatible cache entries.
+    pub world_signature: String,
+    /// Renderer cache schema version.
+    pub renderer_version: u32,
+    /// Palette version used by cache keys.
+    pub palette_version: u32,
+    /// Query exact render chunks for each cache miss before baking.
+    pub cull_missing_chunks: bool,
+}
+
+impl Default for MapRenderSessionConfig {
+    fn default() -> Self {
+        Self {
+            cache_root: PathBuf::new(),
+            tile_cache_memory_limit: 256,
+            world_id: "world".to_string(),
+            world_signature: "default".to_string(),
+            renderer_version: RENDERER_CACHE_VERSION,
+            palette_version: DEFAULT_PALETTE_VERSION,
+            cull_missing_chunks: true,
+        }
+    }
+}
+
+/// Streaming events emitted by [`MapRenderSession`].
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum TileStreamEvent {
+    /// Tile bytes came from the encoded disk cache.
+    Cached {
+        /// Planned tile that was satisfied.
+        planned: PlannedTile,
+        /// Encoded bytes in the requested image format.
+        encoded: Vec<u8>,
+    },
+    /// Tile was rendered by the pipeline.
+    Rendered {
+        /// Planned tile that was rendered.
+        planned: PlannedTile,
+        /// Rendered tile image.
+        tile: TileImage,
+    },
+    /// Tile could not be rendered.
+    Failed {
+        /// Planned tile that failed.
+        planned: PlannedTile,
+        /// Human-readable failure message.
+        error: String,
+    },
+    /// Aggregate progress update.
+    Progress(RenderProgress),
+    /// Stream finished.
+    Complete {
+        /// Aggregated diagnostics.
+        diagnostics: RenderDiagnostics,
+        /// Aggregated pipeline stats.
+        stats: RenderPipelineStats,
+    },
+}
+
+/// Reusable render session that keeps world, renderer, and tile cache alive
+/// across many viewport-driven tile requests.
+#[derive(Clone)]
+pub struct MapRenderSession {
+    renderer: MapRenderer,
+    cache: Arc<Mutex<TileCache>>,
+    config: MapRenderSessionConfig,
+}
+
+impl MapRenderSession {
+    /// Creates a reusable session from an existing renderer.
+    #[must_use]
+    pub fn new(renderer: MapRenderer, config: MapRenderSessionConfig) -> Self {
+        let cache = TileCache::new(
+            config.cache_root.clone(),
+            config.tile_cache_memory_limit.max(1),
+        );
+        Self {
+            renderer,
+            cache: Arc::new(Mutex::new(cache)),
+            config,
+        }
+    }
+
+    /// Returns the underlying renderer.
+    #[must_use]
+    pub const fn renderer(&self) -> &MapRenderer {
+        &self.renderer
+    }
+
+    /// Renders planned web tiles and streams cache hits, rendered tiles, failures,
+    /// and the final aggregate result to `sink`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if rendering, cancellation, or the sink fails.
+    ///
+    /// Rendered tile cache writes are queued after the tile is emitted to the
+    /// stream, and cache write failures are logged.
+    #[allow(clippy::too_many_lines)]
+    pub fn render_web_tiles_streaming_blocking<F>(
+        &self,
+        planned_tiles: &[PlannedTile],
+        mut options: RenderOptions,
+        sink: F,
+    ) -> Result<RenderWebTilesResult>
+    where
+        F: Fn(TileStreamEvent) -> Result<()> + Send + Sync + 'static,
+    {
+        let sink = Arc::new(sink);
+        if planned_tiles.is_empty() {
+            let result = RenderWebTilesResult {
+                diagnostics: RenderDiagnostics::default(),
+                stats: RenderPipelineStats::default(),
+            };
+            sink.as_ref()(TileStreamEvent::Complete {
+                diagnostics: result.diagnostics.clone(),
+                stats: result.stats.clone(),
+            })?;
+            return Ok(result);
+        }
+
+        let mut cached_diagnostics = RenderDiagnostics::default();
+        let mut cached_stats = RenderPipelineStats {
+            planned_tiles: planned_tiles.len(),
+            ..RenderPipelineStats::default()
+        };
+        let mut render_tiles = Vec::new();
+
+        log::debug!(
+            "streaming web tiles (tiles={}, backend={:?}, cache_policy={:?}, cull_missing={})",
+            planned_tiles.len(),
+            options.backend,
+            options.cache_policy,
+            self.config.cull_missing_chunks
+        );
+
+        let ordered_tiles = prioritized_planned_tiles(planned_tiles, options.priority);
+        for planned in &ordered_tiles {
+            check_cancelled(&options)?;
+            let cache_key = self.cache_key_for_planned(planned, options.format);
+            if options.cache_policy == RenderCachePolicy::Use {
+                let cached = self
+                    .cache
+                    .lock()
+                    .map_err(|_| {
+                        BedrockRenderError::Validation("tile cache lock was poisoned".to_string())
+                    })?
+                    .get_disk(&cache_key);
+                if let Some(encoded) = cached {
+                    cached_diagnostics.cache_hits = cached_diagnostics.cache_hits.saturating_add(1);
+                    cached_stats.cache_hits = cached_stats.cache_hits.saturating_add(1);
+                    sink.as_ref()(TileStreamEvent::Cached {
+                        planned: planned.clone(),
+                        encoded,
+                    })?;
+                    continue;
+                }
+            }
+
+            cached_diagnostics.cache_misses = cached_diagnostics.cache_misses.saturating_add(1);
+            cached_stats.cache_misses = cached_stats.cache_misses.saturating_add(1);
+            let planned = self.prepare_planned_tile_for_render(planned, &options)?;
+            if planned.chunk_positions.as_ref().is_some_and(Vec::is_empty) {
+                sink.as_ref()(TileStreamEvent::Failed {
+                    planned,
+                    error: "tile has no renderable chunks".to_string(),
+                })?;
+                continue;
+            }
+            render_tiles.push(planned);
+        }
+
+        let progress_sink = RenderProgressSink::new({
+            let sink = Arc::clone(&sink);
+            move |progress| {
+                if let Err(error) = sink.as_ref()(TileStreamEvent::Progress(progress)) {
+                    log::warn!("tile stream progress sink failed: {error}");
+                }
+            }
+        });
+        options.progress = Some(match options.progress.take() {
+            Some(existing) => RenderProgressSink::new(move |progress| {
+                existing.emit(progress);
+                progress_sink.emit(progress);
+            }),
+            None => progress_sink,
+        });
+
+        let mut final_diagnostics = cached_diagnostics.clone();
+        let mut final_stats = cached_stats.clone();
+        if !render_tiles.is_empty() {
+            let cache_policy = options.cache_policy;
+            let output_format = options.format;
+            let render_group_size =
+                render_tile_stream_group_size(options.execution_profile, render_tiles.len());
+            let cache_writer = (cache_policy == RenderCachePolicy::Use)
+                .then(|| spawn_tile_cache_writer(Arc::clone(&self.cache)))
+                .flatten();
+            let sink = Arc::clone(&sink);
+            for render_group in render_tiles.chunks(render_group_size) {
+                let rendered = self.renderer.render_web_tiles_blocking(
+                    render_group,
+                    options.clone(),
+                    |planned, tile| {
+                        let cache_write = if cache_policy == RenderCachePolicy::Use {
+                            tile.encoded.as_ref().map(|encoded| TileCacheWrite {
+                                key: self.cache_key_for_planned(&planned, output_format),
+                                encoded: encoded.clone(),
+                            })
+                        } else {
+                            None
+                        };
+                        sink.as_ref()(TileStreamEvent::Rendered { planned, tile })?;
+                        if let Some(cache_write) = cache_write {
+                            queue_tile_cache_write(&cache_writer, cache_write);
+                        }
+                        Ok(())
+                    },
+                );
+                match rendered {
+                    Ok(result) => {
+                        final_diagnostics.add(result.diagnostics);
+                        final_stats.add_pipeline_stats(result.stats);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        for planned in render_group.iter().cloned() {
+                            sink.as_ref()(TileStreamEvent::Failed {
+                                planned,
+                                error: message.clone(),
+                            })?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            final_stats.planned_tiles = planned_tiles.len();
+        }
+
+        let result = RenderWebTilesResult {
+            diagnostics: final_diagnostics,
+            stats: final_stats,
+        };
+        sink.as_ref()(TileStreamEvent::Complete {
+            diagnostics: result.diagnostics.clone(),
+            stats: result.stats.clone(),
+        })?;
+        Ok(result)
+    }
+
+    #[cfg(feature = "async")]
+    /// Runs [`MapRenderSession::render_web_tiles_streaming_blocking`] on a Tokio
+    /// blocking task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task fails or rendering fails.
+    pub async fn render_web_tiles_streaming<F>(
+        self: Arc<Self>,
+        planned_tiles: Vec<PlannedTile>,
+        options: RenderOptions,
+        sink: F,
+    ) -> Result<RenderWebTilesResult>
+    where
+        F: Fn(TileStreamEvent) -> Result<()> + Send + Sync + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            self.render_web_tiles_streaming_blocking(&planned_tiles, options, sink)
+        })
+        .await
+        .map_err(|error| BedrockRenderError::Join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    /// Starts streaming web-map tiles on a Tokio blocking task and returns an
+    /// async receiver for tile events.
+    ///
+    /// The task is detached after the receiver is created; render errors are
+    /// delivered as `Failed` events when possible and are also logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the channel capacity is invalid.
+    pub async fn render_web_tiles_streaming_channel(
+        self: Arc<Self>,
+        planned_tiles: Vec<PlannedTile>,
+        options: RenderOptions,
+        capacity: usize,
+    ) -> Result<tokio::sync::mpsc::Receiver<TileStreamEvent>> {
+        let capacity = capacity.max(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+        let error_sender = sender.clone();
+        let planned_tiles_for_error = planned_tiles.clone();
+        tokio::task::spawn_blocking(move || {
+            let send_event = move |event| {
+                sender.blocking_send(event).map_err(|_| {
+                    BedrockRenderError::Validation("tile stream receiver was dropped".to_string())
+                })
+            };
+            if let Err(error) =
+                self.render_web_tiles_streaming_blocking(&planned_tiles, options, send_event)
+            {
+                log::warn!("tile stream task failed: {error}");
+                let message = error.to_string();
+                for planned in planned_tiles_for_error {
+                    if error_sender
+                        .blocking_send(TileStreamEvent::Failed {
+                            planned,
+                            error: message.clone(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
+    fn prepare_planned_tile_for_render(
+        &self,
+        planned: &PlannedTile,
+        options: &RenderOptions,
+    ) -> Result<PlannedTile> {
+        if !self.config.cull_missing_chunks || planned.chunk_positions.is_some() {
+            return Ok(planned.clone());
+        }
+        let region = RenderChunkRegion {
+            dimension: planned.region.dimension,
+            min_chunk_x: planned.region.min_chunk_x,
+            min_chunk_z: planned.region.min_chunk_z,
+            max_chunk_x: planned.region.max_chunk_x,
+            max_chunk_z: planned.region.max_chunk_z,
+        };
+        let positions = self
+            .renderer
+            .world
+            .list_render_chunk_positions_in_region_blocking(
+                region,
+                WorldScanOptions {
+                    threading: WorldThreadingOptions::Single,
+                    ..WorldScanOptions::default()
+                },
+            )?;
+        log::trace!(
+            "culled planned tile ({}, {}) to {} render chunks",
+            planned.job.coord.x,
+            planned.job.coord.z,
+            positions.len()
+        );
+        let mut planned = planned.clone();
+        planned.chunk_positions = Some(positions);
+        check_cancelled(options)?;
+        Ok(planned)
+    }
+
+    fn cache_key_for_planned(&self, planned: &PlannedTile, format: ImageFormat) -> TileCacheKey {
+        TileCacheKey {
+            world_id: self.config.world_id.clone(),
+            world_signature: self.config.world_signature.clone(),
+            renderer_version: self.config.renderer_version,
+            palette_version: self.config.palette_version,
+            dimension: planned.job.coord.dimension,
+            mode: mode_slug(planned.job.mode),
+            chunks_per_tile: planned.layout.chunks_per_tile,
+            blocks_per_pixel: planned.layout.blocks_per_pixel,
+            pixels_per_block: planned.layout.pixels_per_block,
+            tile_x: planned.job.coord.x,
+            tile_z: planned.job.coord.z,
+            extension: image_format_extension(format).to_string(),
+        }
+    }
+}
+
 /// Renderer handle for Bedrock world tile rendering.
 #[derive(Clone)]
 pub struct MapRenderer {
@@ -1753,50 +2705,277 @@ impl MapRenderer {
             return Ok(tiles);
         }
 
-        let next_job = Arc::new(AtomicUsize::new(0));
-        let (sender, receiver) = mpsc::channel::<Result<(usize, TileImage)>>();
-        thread::scope(|scope| {
-            for _ in 0..worker_count {
-                let renderer = self.clone();
-                let mut options = options.clone();
-                options.threading = RenderThreadingOptions::Single;
-                let next_job = Arc::clone(&next_job);
-                let sender = sender.clone();
-                let jobs = &jobs;
-                scope.spawn(move || {
-                    loop {
-                        if check_cancelled(&options).is_err() {
-                            let _ = sender.send(Err(BedrockRenderError::Cancelled));
-                            return;
-                        }
-                        let index = next_job.fetch_add(1, Ordering::Relaxed);
-                        if index >= jobs.len() {
-                            return;
-                        }
-                        let job = jobs[index].clone();
-                        let result = renderer
-                            .render_tile_with_options_blocking(job, &options)
-                            .map(|tile| (index, tile));
-                        if sender.send(result).is_err() {
+        self.render_tiles_from_shared_bakes_blocking(&jobs, &options)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_tiles_from_shared_bakes_blocking(
+        &self,
+        jobs: &[RenderJob],
+        options: &RenderOptions,
+    ) -> Result<Vec<TileImage>> {
+        let total_tiles = jobs.len();
+        let mut tile_dependencies = Vec::with_capacity(total_tiles);
+        let mut dependents = BTreeMap::<ChunkBakeKey, Vec<usize>>::new();
+        let mut bake_key_set = BTreeSet::<ChunkBakeKey>::new();
+
+        for (tile_index, job) in jobs.iter().enumerate() {
+            validate_job(job)?;
+            let mut dependencies = tile_chunk_positions(job)?
+                .into_iter()
+                .map(|pos| ChunkBakeKey {
+                    pos,
+                    mode: job.mode,
+                })
+                .collect::<Vec<_>>();
+            dependencies.sort();
+            dependencies.dedup();
+            for key in dependencies.iter().copied() {
+                bake_key_set.insert(key);
+                dependents.entry(key).or_default().push(tile_index);
+            }
+            tile_dependencies.push(dependencies);
+        }
+
+        let bake_keys = bake_key_set.into_iter().collect::<Vec<_>>();
+        if bake_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let worker_count = options.threading.resolve_for_profile_checked(
+            options.execution_profile,
+            bake_keys.len().max(total_tiles),
+        )?;
+        let queue_capacity = pipeline_queue_capacity(options, worker_count);
+        let loader_count = pipeline_loader_count(worker_count, bake_keys.len());
+        let compose_count = pipeline_compose_count(worker_count, loader_count, total_tiles);
+        let bake_count =
+            pipeline_bake_count(worker_count, loader_count, compose_count, bake_keys.len());
+        let (load_sender, load_receiver) = crossbeam_channel::bounded(queue_capacity);
+        let (loaded_sender, loaded_receiver) = crossbeam_channel::bounded(queue_capacity);
+        let (baked_sender, baked_receiver) = crossbeam_channel::bounded(queue_capacity);
+        let (compose_sender, compose_receiver) =
+            crossbeam_channel::bounded::<TileComposeTask>(queue_capacity);
+        let (tile_sender, tile_receiver) =
+            crossbeam_channel::bounded::<Result<TileComposeResult>>(queue_capacity);
+
+        let pool = render_cpu_pool(worker_count)?;
+        pool.scope(|scope| {
+            {
+                let load_sender = load_sender.clone();
+                let bake_keys = &bake_keys;
+                scope.spawn(move |_| {
+                    for key in bake_keys.iter().copied() {
+                        if load_sender.send(key).is_err() {
                             return;
                         }
                     }
                 });
             }
-            drop(sender);
-            let mut completed = 0usize;
-            let mut tiles = Vec::with_capacity(total_tiles);
-            for result in receiver {
-                let (index, tile) = result?;
-                tiles.push((index, tile));
-                completed = completed.saturating_add(1);
-                emit_progress(&options, completed, total_tiles);
-                if completed == total_tiles {
+            drop(load_sender);
+
+            for _ in 0..loader_count {
+                let load_receiver = load_receiver.clone();
+                let loaded_sender = loaded_sender.clone();
+                let renderer = self.clone();
+                let options = options.clone();
+                scope.spawn(move |_| {
+                    for key in load_receiver {
+                        if check_cancelled(&options).is_err() {
+                            let _ = loaded_sender.send(Err(BedrockRenderError::Cancelled));
+                            return;
+                        }
+                        let result = renderer
+                            .load_render_chunk_data_blocking(key.pos, key.mode)
+                            .map(|data| (key, data));
+                        if loaded_sender.send(result).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(loaded_sender);
+
+            for _ in 0..bake_count {
+                let loaded_receiver = loaded_receiver.clone();
+                let baked_sender = baked_sender.clone();
+                let renderer = self.clone();
+                let options = options.clone();
+                scope.spawn(move |_| {
+                    for message in loaded_receiver {
+                        let (key, data) = match message {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let _ = baked_sender.send(Err(error));
+                                return;
+                            }
+                        };
+                        if check_cancelled(&options).is_err() {
+                            let _ = baked_sender.send(Err(BedrockRenderError::Cancelled));
+                            return;
+                        }
+                        let result = renderer
+                            .bake_chunk_data(
+                                data,
+                                BakeOptions {
+                                    mode: key.mode,
+                                    surface: options.surface,
+                                },
+                            )
+                            .map(|bake| (key, bake));
+                        if baked_sender.send(result).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(baked_sender);
+
+            for _ in 0..compose_count {
+                let compose_receiver = compose_receiver.clone();
+                let tile_sender = tile_sender.clone();
+                let renderer = self.clone();
+                let options = options.clone();
+                scope.spawn(move |_| {
+                    for task in compose_receiver {
+                        let result = renderer
+                            .render_tile_from_chunk_bakes_blocking(
+                                task.job,
+                                &options,
+                                &task.bakes,
+                                task.diagnostics,
+                            )
+                            .map(|tile| TileComposeResult {
+                                tile_index: task.tile_index,
+                                tile,
+                            });
+                        if tile_sender.send(result).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(compose_receiver);
+            drop(tile_sender);
+
+            let mut bakes = BTreeMap::<ChunkBakeKey, ChunkBake>::new();
+            let mut remaining_dependencies =
+                tile_dependencies.iter().map(Vec::len).collect::<Vec<_>>();
+            let mut tiles = vec![None; total_tiles];
+            let mut submitted_tiles = 0usize;
+            let mut completed_tiles = 0usize;
+
+            for message in baked_receiver {
+                let (key, bake) = message?;
+                bakes.insert(key, bake);
+                if let Some(tile_indexes) = dependents.get(&key) {
+                    for tile_index in tile_indexes.iter().copied() {
+                        let Some(remaining) = remaining_dependencies.get_mut(tile_index) else {
+                            return Err(BedrockRenderError::Validation(
+                                "tile dependency index is out of range".to_string(),
+                            ));
+                        };
+                        *remaining = remaining.saturating_sub(1);
+                        if *remaining != 0 {
+                            continue;
+                        }
+                        let (tile_bakes, diagnostics) =
+                            collect_tile_chunk_bakes(&tile_dependencies[tile_index], &bakes)?;
+                        if compose_count == 0 {
+                            let tile = self.render_tile_from_chunk_bakes_blocking(
+                                jobs[tile_index].clone(),
+                                options,
+                                &tile_bakes,
+                                diagnostics,
+                            )?;
+                            store_tile_compose_result(
+                                Ok(TileComposeResult { tile_index, tile }),
+                                &mut tiles,
+                                &mut completed_tiles,
+                                total_tiles,
+                                options,
+                            )?;
+                            submitted_tiles = submitted_tiles.saturating_add(1);
+                            if submitted_tiles == total_tiles {
+                                break;
+                            }
+                            continue;
+                        }
+                        let mut task = TileComposeTask {
+                            tile_index,
+                            job: jobs[tile_index].clone(),
+                            bakes: tile_bakes,
+                            diagnostics,
+                        };
+                        loop {
+                            match compose_sender.try_send(task) {
+                                Ok(()) => {
+                                    submitted_tiles = submitted_tiles.saturating_add(1);
+                                    break;
+                                }
+                                Err(crossbeam_channel::TrySendError::Full(returned_task)) => {
+                                    task = returned_task;
+                                    let message = tile_receiver.recv().map_err(|_| {
+                                        BedrockRenderError::Validation(
+                                            "tile compose pipeline stopped early".to_string(),
+                                        )
+                                    })?;
+                                    store_tile_compose_result(
+                                        message,
+                                        &mut tiles,
+                                        &mut completed_tiles,
+                                        total_tiles,
+                                        options,
+                                    )?;
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    return Err(BedrockRenderError::Validation(
+                                        "tile compose worker stopped early".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        if submitted_tiles == total_tiles {
+                            break;
+                        }
+                    }
+                }
+                if submitted_tiles == total_tiles {
                     break;
                 }
             }
-            tiles.sort_by_key(|(index, _)| *index);
-            Ok(tiles.into_iter().map(|(_, tile)| tile).collect())
+            drop(compose_sender);
+
+            if submitted_tiles != total_tiles {
+                return Err(BedrockRenderError::Validation(
+                    "shared tile bake pipeline stopped before all tiles completed".to_string(),
+                ));
+            }
+            while completed_tiles < total_tiles {
+                let message = tile_receiver.recv().map_err(|_| {
+                    BedrockRenderError::Validation(
+                        "tile compose pipeline stopped before all tiles completed".to_string(),
+                    )
+                })?;
+                store_tile_compose_result(
+                    message,
+                    &mut tiles,
+                    &mut completed_tiles,
+                    total_tiles,
+                    options,
+                )?;
+            }
+
+            tiles
+                .into_iter()
+                .map(|tile| {
+                    tile.ok_or_else(|| {
+                        BedrockRenderError::Validation(
+                            "rendered tile result is missing".to_string(),
+                        )
+                    })
+                })
+                .collect()
         })
     }
 
@@ -1960,7 +3139,13 @@ impl MapRenderer {
                 fixed_y,
                 biome_y,
                 load_all_biomes: loads_biome_plane,
+                block_entities: uses_surface,
                 subchunk_decode: SubChunkDecodeMode::FullIndices,
+                threading: WorldThreadingOptions::Single,
+                pipeline: options.cpu.to_world_pipeline(),
+                cancel: render_world_cancel(options),
+                priority: render_chunk_priority_for_region(options, chunk_region),
+                ..RenderRegionLoadOptions::default()
             },
         )?;
         let chunk_width = u32::try_from(
@@ -2053,7 +3238,13 @@ impl MapRenderer {
                 fixed_y,
                 biome_y,
                 load_all_biomes: loads_biome_plane,
+                block_entities: uses_surface,
                 subchunk_decode: SubChunkDecodeMode::FullIndices,
+                threading: WorldThreadingOptions::Single,
+                pipeline: options.cpu.to_world_pipeline(),
+                cancel: render_world_cancel(options),
+                priority: render_chunk_priority_for_region(options, chunk_region),
+                ..RenderChunkLoadOptions::default()
             },
         )?;
         self.bake_loaded_region_chunks(coord, chunk_region, data, options, mode)
@@ -2208,13 +3399,6 @@ impl MapRenderer {
                 .ok_or_else(|| {
                     BedrockRenderError::Validation("planned tile references missing region".into())
                 })?;
-            let region_start = Instant::now();
-            let regions = self.bake_web_regions_blocking(&wave_plans, options)?;
-            let region_bake_ms = region_start.elapsed().as_millis();
-            stats.region_bake_ms = stats.region_bake_ms.saturating_add(region_bake_ms);
-            stats.bake_ms = stats.bake_ms.saturating_add(region_bake_ms);
-            stats.baked_regions = stats.baked_regions.saturating_add(regions.len());
-            stats.region_cache_misses = stats.region_cache_misses.saturating_add(regions.len());
             let wave_cache_bytes = wave_plans.iter().fold(0usize, |total, plan| {
                 total.saturating_add(
                     plan.chunk_positions
@@ -2223,87 +3407,68 @@ impl MapRenderer {
                 )
             });
             stats.peak_cache_bytes = stats.peak_cache_bytes.max(wave_cache_bytes);
-            for bake in regions.values() {
-                diagnostics.add(bake.diagnostics.clone());
-            }
-            stats.baked_chunks = diagnostics.baked_chunks;
-            let render_tile_indexes = pending_tiles
-                .iter()
-                .copied()
-                .filter(|index| {
-                    tile_region_keys[*index]
-                        .iter()
-                        .all(|key| regions.contains_key(key))
-                })
-                .collect::<Vec<_>>();
-            let compose_start = Instant::now();
-            let compose_stats = render_web_tile_indexes(
-                self,
+            let wave_result = self.render_web_region_wave_streaming(
                 planned_tiles,
-                &render_tile_indexes,
+                &pending_tiles,
+                &tile_region_keys,
+                &wave_plans,
                 options,
-                &regions,
                 worker_count,
                 &sink,
             )?;
-            stats.add_tile_compose_stats(compose_stats);
-            let compose_ms = compose_start.elapsed().as_millis();
-            stats.tile_compose_ms = stats.tile_compose_ms.saturating_add(compose_ms);
-            stats.encode_ms = stats.encode_ms.saturating_add(compose_ms);
-            let rendered = render_tile_indexes.into_iter().collect::<BTreeSet<_>>();
-            pending_tiles.retain(|index| !rendered.contains(index));
+            diagnostics.add(wave_result.diagnostics);
+            stats.add_pipeline_stats(wave_result.stats);
+            stats.baked_chunks = diagnostics.baked_chunks;
+            pending_tiles.retain(|index| !wave_result.rendered_tiles.contains(index));
         }
         Ok(RenderWebTilesResult { diagnostics, stats })
     }
 
-    fn bake_web_regions_blocking(
+    #[allow(clippy::too_many_arguments)]
+    fn render_web_region_wave_streaming<F>(
         &self,
-        plans: &[RegionPlan],
+        planned_tiles: &[PlannedTile],
+        pending_tiles: &[usize],
+        tile_region_keys: &[Vec<RegionBakeKey>],
+        wave_plans: &[RegionPlan],
         options: &RenderOptions,
-    ) -> Result<BTreeMap<RegionBakeKey, RegionBake>> {
-        if plans.is_empty() {
-            return Ok(BTreeMap::new());
+        worker_count: usize,
+        sink: &F,
+    ) -> Result<RegionWaveRenderResult>
+    where
+        F: Fn(PlannedTile, TileImage) -> Result<()> + Send + Sync,
+    {
+        if wave_plans.is_empty() {
+            return Ok(RegionWaveRenderResult {
+                rendered_tiles: BTreeSet::new(),
+                diagnostics: RenderDiagnostics::default(),
+                stats: RenderPipelineStats::default(),
+            });
         }
-        let worker_count = options
-            .threading
-            .resolve_for_profile_checked(options.execution_profile, plans.len())?;
-        if worker_count == 1 {
-            let mut regions = BTreeMap::new();
-            for plan in plans {
-                check_cancelled(options)?;
-                regions.insert(
-                    plan.key,
-                    self.bake_region_chunk_positions_blocking(
-                        plan.key.coord,
-                        plan.region,
-                        &plan.chunk_positions,
-                        options,
-                        plan.key.mode,
-                    )?,
-                );
-            }
-            return Ok(regions);
-        }
-        let next_key = Arc::new(AtomicUsize::new(0));
-        let (sender, receiver) = mpsc::channel::<Result<(RegionBakeKey, RegionBake)>>();
-        thread::scope(|scope| {
-            for _ in 0..worker_count {
-                let next_key = Arc::clone(&next_key);
+
+        let region_worker_count = worker_count.min(wave_plans.len()).max(1);
+        let queue_capacity = pipeline_queue_capacity(options, region_worker_count);
+        let next_plan = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = crossbeam_channel::bounded(queue_capacity);
+
+        let pool = render_cpu_pool(region_worker_count)?;
+        pool.scope(|scope| {
+            for _ in 0..region_worker_count {
+                let next_plan = Arc::clone(&next_plan);
                 let sender = sender.clone();
                 let renderer = self.clone();
                 let options = options.clone();
-                scope.spawn(move || {
+                scope.spawn(move |_| {
                     loop {
                         if check_cancelled(&options).is_err() {
-                            let send_result = sender.send(Err(BedrockRenderError::Cancelled));
-                            drop(send_result);
+                            let _ = sender.send(Err(BedrockRenderError::Cancelled));
                             return;
                         }
-                        let index = next_key.fetch_add(1, Ordering::Relaxed);
-                        if index >= plans.len() {
+                        let index = next_plan.fetch_add(1, Ordering::Relaxed);
+                        let Some(plan) = wave_plans.get(index).cloned() else {
                             return;
-                        }
-                        let plan = plans[index].clone();
+                        };
+                        let started = Instant::now();
                         let result = renderer
                             .bake_region_chunk_positions_blocking(
                                 plan.key.coord,
@@ -2312,7 +3477,7 @@ impl MapRenderer {
                                 &options,
                                 plan.key.mode,
                             )
-                            .map(|bake| (plan.key, bake));
+                            .map(|bake| (plan.key, bake, started.elapsed().as_millis()));
                         if sender.send(result).is_err() {
                             return;
                         }
@@ -2320,12 +3485,64 @@ impl MapRenderer {
                 });
             }
             drop(sender);
-            let mut regions = BTreeMap::new();
+
+            let mut regions = BTreeMap::<RegionBakeKey, RegionBake>::new();
+            let mut rendered_tiles = BTreeSet::new();
+            let mut diagnostics = RenderDiagnostics::default();
+            let mut stats = RenderPipelineStats::default();
+            let mut completed_regions = 0usize;
+
             for message in receiver {
-                let (key, region) = message?;
+                let (key, region, region_bake_ms) = message?;
+                diagnostics.add(region.diagnostics.clone());
+                stats.region_bake_ms = stats.region_bake_ms.saturating_add(region_bake_ms);
+                stats.bake_ms = stats.bake_ms.saturating_add(region_bake_ms);
+                stats.baked_regions = stats.baked_regions.saturating_add(1);
+                stats.region_cache_misses = stats.region_cache_misses.saturating_add(1);
+                stats.baked_chunks = diagnostics.baked_chunks;
                 regions.insert(key, region);
+                completed_regions = completed_regions.saturating_add(1);
+
+                let ready_tile_indexes = ready_web_tile_indexes(
+                    pending_tiles,
+                    tile_region_keys,
+                    &regions,
+                    &rendered_tiles,
+                )?;
+                if !ready_tile_indexes.is_empty() {
+                    let compose_start = Instant::now();
+                    let compose_stats = render_web_tile_indexes(
+                        self,
+                        planned_tiles,
+                        &ready_tile_indexes,
+                        options,
+                        &regions,
+                        worker_count,
+                        sink,
+                    )?;
+                    stats.add_tile_compose_stats(compose_stats);
+                    let compose_ms = compose_start.elapsed().as_millis();
+                    stats.tile_compose_ms = stats.tile_compose_ms.saturating_add(compose_ms);
+                    stats.encode_ms = stats.encode_ms.saturating_add(compose_ms);
+                    rendered_tiles.extend(ready_tile_indexes);
+                }
+
+                if completed_regions == wave_plans.len() {
+                    break;
+                }
             }
-            Ok(regions)
+
+            if completed_regions != wave_plans.len() {
+                return Err(BedrockRenderError::Validation(
+                    "region bake pipeline stopped before all regions completed".to_string(),
+                ));
+            }
+
+            Ok(RegionWaveRenderResult {
+                rendered_tiles,
+                diagnostics,
+                stats,
+            })
         })
     }
 
@@ -2335,6 +3552,7 @@ impl MapRenderer {
         job: RenderJob,
         options: &RenderOptions,
         regions: &BTreeMap<RegionBakeKey, RegionBake>,
+        gpu_work_items: usize,
     ) -> Result<(TileImage, TileComposeStats)> {
         validate_job(&job)?;
         check_cancelled(options)?;
@@ -2346,7 +3564,8 @@ impl MapRenderer {
             })?;
         let request = RenderBackend::requested_for_options(options);
         let should_try_gpu =
-            should_try_gpu_compose(request, pixel_count, job.mode, options.surface);
+            should_try_gpu_compose(request, pixel_count, job.mode, options.surface, options.gpu)
+                && !tile_pixels_cover_multiple_blocks(&job);
         let (rgba, diagnostics, compose_stats) = if should_try_gpu {
             let prepared = prepare_region_tile_compose(
                 self.palette.missing_chunk_color(),
@@ -2354,14 +3573,34 @@ impl MapRenderer {
                 options,
                 regions,
             )?;
+            let max_in_flight = options
+                .gpu
+                .resolve_max_in_flight(options.execution_profile, gpu_work_items);
+            let batch_size = options
+                .gpu
+                .resolve_batch_size(max_in_flight, gpu_work_items);
             let input = GpuTileComposeInput {
                 width: job.tile_size,
                 height: job.tile_size,
+                pixels_per_block: job.pixels_per_block,
+                blocks_per_pixel: job.scale,
                 colors: &prepared.colors,
                 heights: &prepared.heights,
                 water_depths: &prepared.water_depths,
                 lighting_enabled: prepared.lighting_enabled,
                 lighting: options.surface.lighting,
+                block_boundaries: options.surface.block_boundaries,
+                max_in_flight,
+                batch_size,
+                readback_workers: options.gpu.resolve_readback_workers(max_in_flight),
+                submit_workers: options.gpu.resolve_submit_workers(max_in_flight),
+                batch_pixels: options.gpu.resolve_batch_pixels(options.execution_profile),
+                buffer_pool_bytes: options
+                    .gpu
+                    .resolve_buffer_pool_bytes(options.execution_profile),
+                staging_pool_bytes: options
+                    .gpu
+                    .resolve_staging_pool_bytes(options.execution_profile),
             };
             match super::gpu::compose_tile(&input) {
                 Ok(output) => {
@@ -2373,8 +3612,9 @@ impl MapRenderer {
                     diagnostics.gpu_fallbacks = diagnostics.gpu_fallbacks.saturating_add(1);
                     (
                         compose_region_tile_from_prepared(
+                            &self.palette,
                             &prepared,
-                            job.tile_size,
+                            &job,
                             options.surface,
                         ),
                         diagnostics,
@@ -2409,44 +3649,29 @@ impl MapRenderer {
     ///
     /// Returns an error if the chunk cannot be loaded or decoded for the requested mode.
     pub fn bake_chunk_blocking(&self, pos: ChunkPos, options: BakeOptions) -> Result<ChunkBake> {
-        let fixed_y = match options.mode {
-            RenderMode::LayerBlocks { y } | RenderMode::CaveSlice { y } => Some(y),
-            _ => None,
-        };
-        let biome_y = match options.mode {
-            RenderMode::Biome { y } | RenderMode::RawBiomeLayer { y } => Some(y),
-            _ => Some(64),
-        };
-        let uses_surface = matches!(options.mode, RenderMode::SurfaceBlocks);
-        let loads_biome_plane = matches!(
-            options.mode,
-            RenderMode::SurfaceBlocks | RenderMode::Biome { .. } | RenderMode::RawBiomeLayer { .. }
-        );
-        let data = self.world.load_render_chunk_blocking(
-            pos,
-            RenderChunkLoadOptions {
-                surface: uses_surface,
-                surface_subchunks: if uses_surface {
-                    RenderSurfaceSubchunkMode::Full
-                } else {
-                    RenderSurfaceSubchunkMode::Needed
-                },
-                fixed_y,
-                biome_y,
-                load_all_biomes: loads_biome_plane,
-                subchunk_decode: SubChunkDecodeMode::FullIndices,
-            },
-        )?;
+        let data = self.load_render_chunk_data_blocking(pos, options.mode)?;
         self.bake_chunk_data(data, options)
+    }
+
+    fn load_render_chunk_data_blocking(
+        &self,
+        pos: ChunkPos,
+        mode: RenderMode,
+    ) -> Result<RenderChunkData> {
+        Ok(self
+            .world
+            .load_render_chunk_blocking(pos, render_chunk_load_options(mode))?)
     }
 
     fn bake_chunk_data(&self, data: RenderChunkData, options: BakeOptions) -> Result<ChunkBake> {
         let mode = options.mode;
         let pos = data.pos;
+        let block_entity_index = block_entity_index(&data);
         let mut context = ChunkBakeContext {
             palette: &self.palette,
             options,
             data,
+            block_entity_index,
             diagnostics: RenderDiagnostics::default(),
         };
         let payload = context.bake_payload()?;
@@ -2474,12 +3699,6 @@ impl MapRenderer {
     ) -> Result<TileImage> {
         validate_job(&job)?;
         check_cancelled(options)?;
-        let pixel_count = usize::try_from(job.tile_size)
-            .ok()
-            .and_then(|size| size.checked_mul(size))
-            .ok_or_else(|| {
-                BedrockRenderError::Validation("tile pixel count overflow".to_string())
-            })?;
         let positions = tile_chunk_positions(&job)?;
         let bake_options = BakeOptions {
             mode: job.mode,
@@ -2494,7 +3713,25 @@ impl MapRenderer {
             diagnostics.add(bake.diagnostics.clone());
             bakes.insert(bake.pos, bake);
         }
+        self.render_tile_from_chunk_bakes_blocking(job, options, &bakes, diagnostics)
+    }
 
+    #[allow(clippy::needless_pass_by_value)]
+    fn render_tile_from_chunk_bakes_blocking(
+        &self,
+        job: RenderJob,
+        options: &RenderOptions,
+        bakes: &BTreeMap<ChunkPos, ChunkBake>,
+        mut diagnostics: RenderDiagnostics,
+    ) -> Result<TileImage> {
+        validate_job(&job)?;
+        check_cancelled(options)?;
+        let pixel_count = usize::try_from(job.tile_size)
+            .ok()
+            .and_then(|size| size.checked_mul(size))
+            .ok_or_else(|| {
+                BedrockRenderError::Validation("tile pixel count overflow".to_string())
+            })?;
         let mut rgba = vec![0; pixel_count.saturating_mul(4)];
         let mut pixel_index = 0usize;
         for pixel_z in 0..job.tile_size {
@@ -2502,31 +3739,15 @@ impl MapRenderer {
                 if (pixel_count > 4096) && pixel_index.is_multiple_of(4096) {
                     check_cancelled(options)?;
                 }
-                let (block_x, block_z) = tile_pixel_to_block(&job, pixel_x, pixel_z)?;
-                let block_pos = BlockPos {
-                    x: block_x,
-                    y: 0,
-                    z: block_z,
-                };
-                let chunk_pos = block_pos.to_chunk_pos(job.coord.dimension);
-                let (local_x, _, local_z) = block_pos.in_chunk_offset();
-                let color = if let Some(color) = bakes
-                    .get(&chunk_pos)
-                    .and_then(|bake| chunk_bake_color(bake, u32::from(local_x), u32::from(local_z)))
-                {
-                    shade_chunk_bake_color(
-                        color,
-                        &bakes,
-                        chunk_pos,
-                        local_x,
-                        local_z,
-                        options.surface,
-                    )
-                } else {
-                    diagnostics.missing_chunks = diagnostics.missing_chunks.saturating_add(1);
-                    diagnostics.record_transparent_pixel();
-                    self.palette.missing_chunk_color()
-                };
+                let color = baked_tile_pixel_color(
+                    &self.palette,
+                    &job,
+                    options,
+                    bakes,
+                    pixel_x,
+                    pixel_z,
+                    &mut diagnostics,
+                )?;
                 write_rgba_pixel(&mut rgba, pixel_index, color);
                 pixel_index += 1;
             }
@@ -2750,18 +3971,19 @@ impl<'a> TileRenderContext<'a> {
         };
         let chunk_pos = block_pos.to_chunk_pos(job.coord.dimension);
         let subchunk_y = block_y_to_subchunk_y(y)?;
-        let block_name = self
+        let block_state = self
             .cached_subchunk(chunk_pos, subchunk_y)?
-            .and_then(|subchunk| block_name_at(subchunk, block_pos))
-            .map(str::to_owned);
-        let Some(name) = block_name else {
+            .and_then(|subchunk| block_state_at(subchunk, block_pos))
+            .cloned();
+        let Some(state) = block_state else {
             self.diagnostics.record_transparent_pixel();
             return Ok(self.palette.missing_chunk_color());
         };
+        let name = state.name.clone();
         if !self.palette.has_block_color(&name) {
             self.diagnostics.record_unknown_block(&name);
         }
-        Ok(self.palette.block_color(&name))
+        Ok(state_block_color(self.palette, &state))
     }
 
     fn cave_color_at(
@@ -2818,33 +4040,16 @@ impl<'a> TileRenderContext<'a> {
         let chunk_pos = base_pos.to_chunk_pos(job.coord.dimension);
         let (local_x, _, local_z) = base_pos.in_chunk_offset();
         let (min_y, max_y) = chunk_pos.y_range(bedrock_world::ChunkVersion::New);
-        let Some(height) = self.cached_height(chunk_pos, local_x, local_z)? else {
+        let Some(_height) = self.cached_height(chunk_pos, local_x, local_z)? else {
             self.diagnostics.missing_heightmaps =
                 self.diagnostics.missing_heightmaps.saturating_add(1);
             self.diagnostics.missing_chunks = self.diagnostics.missing_chunks.saturating_add(1);
             self.diagnostics.record_transparent_pixel();
             return Ok(self.palette.missing_chunk_color());
         };
-        let start_y = i32::from(height).clamp(min_y, max_y);
         let mut visited_subchunk = false;
-        if start_y < max_y {
-            let (color, visited) = self.find_surface_block_color(
-                chunk_pos,
-                block_x,
-                block_z,
-                local_x,
-                local_z,
-                start_y.saturating_add(1),
-                max_y,
-                min_y,
-            )?;
-            visited_subchunk |= visited;
-            if let Some(color) = color {
-                return Ok(color);
-            }
-        }
         let (color, visited) = self.find_surface_block_color(
-            chunk_pos, block_x, block_z, local_x, local_z, min_y, start_y, min_y,
+            chunk_pos, block_x, block_z, local_x, local_z, min_y, max_y, min_y,
         )?;
         visited_subchunk |= visited;
         if let Some(color) = color {
@@ -2870,6 +4075,7 @@ impl<'a> TileRenderContext<'a> {
         world_min_y: i32,
     ) -> Result<(Option<RgbaColor>, bool)> {
         let mut visited_subchunk = false;
+        let mut overlay = None;
         for y in (min_y..=start_y).rev() {
             let subchunk_y = block_y_to_subchunk_y(y)?;
             let Some(subchunk) = self.cached_subchunk(chunk_pos, subchunk_y)? else {
@@ -2881,13 +4087,31 @@ impl<'a> TileRenderContext<'a> {
                 y,
                 z: block_z,
             };
-            let Some(name) = block_name_at(subchunk, block_pos).map(str::to_owned) else {
+            let Some(state) = block_state_at(subchunk, block_pos).cloned() else {
                 continue;
             };
+            let name = state.name.clone();
             if self.surface_options.skip_air && self.palette.is_air_block(&name) {
                 continue;
             }
             let biome_id = self.cached_biome_id(chunk_pos, local_x, local_z, y)?;
+            if let Some(alpha) = surface_overlay_alpha(&name) {
+                if overlay.is_none() {
+                    if !self.palette.has_block_color(&name) {
+                        self.diagnostics.record_unknown_block(&name);
+                    }
+                    overlay = Some(SurfaceOverlay {
+                        color: state_surface_block_color(
+                            self.palette,
+                            &state,
+                            biome_id,
+                            self.surface_options.biome_tint,
+                        ),
+                        alpha,
+                    });
+                }
+                continue;
+            }
             if !self.palette.has_block_color(&name) {
                 self.diagnostics.record_unknown_block(&name);
                 if !self.surface_options.render_unknown_blocks {
@@ -2895,29 +4119,46 @@ impl<'a> TileRenderContext<'a> {
                     return Ok((Some(self.palette.void_color()), visited_subchunk));
                 }
             }
-            let color = if self.palette.is_water_block(&name)
-                && self.surface_options.transparent_water
-            {
+            let is_water = self.palette.is_water_block(&name);
+            let (color, water_depth) = if is_water && self.surface_options.transparent_water {
                 let (depth, under_name) =
                     self.find_under_water_block(chunk_pos, block_x, block_z, y, world_min_y)?;
-                self.palette.transparent_water_color(
-                    &name,
-                    under_name.as_deref(),
-                    biome_id,
+                (
+                    self.palette.transparent_water_color(
+                        &name,
+                        under_name.as_deref(),
+                        biome_id,
+                        depth,
+                        self.surface_options.biome_tint,
+                    ),
                     depth,
-                    self.surface_options.biome_tint,
                 )
             } else {
-                self.palette
-                    .surface_block_color(&name, biome_id, self.surface_options.biome_tint)
+                (
+                    state_surface_block_color(
+                        self.palette,
+                        &state,
+                        biome_id,
+                        self.surface_options.biome_tint,
+                    ),
+                    0,
+                )
             };
+            let color = blend_surface_overlay(color, overlay);
             let shade_y = i16::try_from(y).map_err(|_| {
                 BedrockRenderError::Validation(format!(
                     "surface block y={y} cannot be represented as i16"
                 ))
             })?;
             return Ok((
-                Some(self.surface_shaded_color(chunk_pos, local_x, local_z, shade_y, color)?),
+                Some(self.surface_shaded_color(
+                    chunk_pos,
+                    local_x,
+                    local_z,
+                    shade_y,
+                    color,
+                    water_depth,
+                )?),
                 visited_subchunk,
             ));
         }
@@ -3018,8 +4259,9 @@ impl<'a> TileRenderContext<'a> {
         local_z: u8,
         height: i16,
         color: RgbaColor,
+        water_depth: u8,
     ) -> Result<RgbaColor> {
-        if !self.surface_options.height_shading {
+        if !self.surface_options.height_shading || shallow_water_skips_lighting(water_depth) {
             return Ok(color);
         }
         let west_x = local_x.saturating_sub(1);
@@ -3038,9 +4280,16 @@ impl<'a> TileRenderContext<'a> {
         let south = self
             .cached_height(chunk_pos, local_x, south_z)?
             .unwrap_or(height);
-        Ok(self
+        let shaded = self
             .palette
-            .height_normal_shaded_color(color, west, east, north, south))
+            .height_normal_shaded_color(color, west, east, north, south);
+        Ok(moderate_surface_lighting(
+            self.palette,
+            color,
+            shaded,
+            water_depth,
+            self.surface_options,
+        ))
     }
 }
 
@@ -3048,6 +4297,7 @@ struct ChunkBakeContext<'a> {
     palette: &'a RenderPalette,
     options: BakeOptions,
     data: RenderChunkData,
+    block_entity_index: BTreeMap<(u8, i32, u8), usize>,
     diagnostics: RenderDiagnostics,
 }
 
@@ -3058,6 +4308,12 @@ struct SurfaceSample {
     underwater_height: Option<i16>,
     water_depth: u8,
     is_water: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SurfaceOverlay {
+    color: RgbaColor,
+    alpha: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -3182,7 +4438,7 @@ impl ChunkBakeContext<'_> {
                 is_water: false,
             };
         }
-        let Some(height) = self
+        let Some(_height) = self
             .data
             .height_map
             .as_ref()
@@ -3202,13 +4458,7 @@ impl ChunkBakeContext<'_> {
         };
 
         let (min_y, max_y) = self.data.pos.y_range(bedrock_world::ChunkVersion::New);
-        if i32::from(height) < max_y
-            && let Some(sample) =
-                self.find_surface_sample(local_x, local_z, i32::from(height) + 1, max_y)
-        {
-            return sample;
-        }
-        if let Some(sample) = self.find_surface_sample(local_x, local_z, min_y, i32::from(height)) {
+        if let Some(sample) = self.find_surface_sample(local_x, local_z, min_y, max_y) {
             return sample;
         }
 
@@ -3230,15 +4480,36 @@ impl ChunkBakeContext<'_> {
         start_y: i32,
     ) -> Option<SurfaceSample> {
         let (_, max_y) = self.data.pos.y_range(bedrock_world::ChunkVersion::New);
+        let mut overlay = None;
         for y in (min_y..=start_y.clamp(min_y, max_y)).rev() {
-            let Some(name) = self.block_name_at(local_x, y, local_z) else {
+            let Some(state) = self.block_state_at(local_x, y, local_z).cloned() else {
                 continue;
             };
+            let name = state.name.as_str();
             if self.options.surface.skip_air && self.palette.is_air_block(name) {
                 continue;
             }
-            let name = name.to_string();
+            let name = state.name.clone();
+            let block_entity = self.block_entity_at(local_x, y, local_z).cloned();
             let biome_id = self.biome_id_at_or_top(local_x, local_z, y);
+            if let Some(alpha) = surface_overlay_alpha(&name) {
+                if overlay.is_none() {
+                    if !self.palette.has_block_color(&name) {
+                        self.diagnostics.record_unknown_block(&name);
+                    }
+                    overlay = Some(SurfaceOverlay {
+                        color: special_surface_block_color(
+                            self.palette,
+                            &state,
+                            block_entity.as_ref(),
+                            biome_id,
+                            self.options.surface.biome_tint,
+                        ),
+                        alpha,
+                    });
+                }
+                continue;
+            }
             if !self.palette.has_block_color(&name) {
                 self.diagnostics.record_unknown_block(&name);
                 if !self.options.surface.render_unknown_blocks {
@@ -3267,9 +4538,15 @@ impl ChunkBakeContext<'_> {
                     self.options.surface.biome_tint,
                 )
             } else {
-                self.palette
-                    .surface_block_color(&name, biome_id, self.options.surface.biome_tint)
+                special_surface_block_color(
+                    self.palette,
+                    &state,
+                    block_entity.as_ref(),
+                    biome_id,
+                    self.options.surface.biome_tint,
+                )
             };
+            let color = blend_surface_overlay(color, overlay);
             let shade_y = i16::try_from(y).unwrap_or(if y < 0 { i16::MIN } else { i16::MAX });
             return Some(SurfaceSample {
                 color,
@@ -3304,14 +4581,15 @@ impl ChunkBakeContext<'_> {
     }
 
     fn layer_color_at(&mut self, local_x: u8, local_z: u8, y: i32) -> RgbaColor {
-        let Some(name) = self.block_name_at(local_x, y, local_z).map(str::to_string) else {
+        let Some(state) = self.block_state_at(local_x, y, local_z).cloned() else {
             self.diagnostics.record_transparent_pixel();
             return self.palette.missing_chunk_color();
         };
+        let name = state.name.clone();
         if !self.palette.has_block_color(&name) {
             self.diagnostics.record_unknown_block(&name);
         }
-        self.palette.block_color(&name)
+        state_block_color(self.palette, &state)
     }
 
     fn cave_color_at(&self, local_x: u8, local_z: u8, y: i32) -> RgbaColor {
@@ -3320,12 +4598,21 @@ impl ChunkBakeContext<'_> {
     }
 
     fn block_name_at(&self, local_x: u8, y: i32, local_z: u8) -> Option<&str> {
+        self.block_state_at(local_x, y, local_z)
+            .map(|state| state.name.as_str())
+    }
+
+    fn block_state_at(&self, local_x: u8, y: i32, local_z: u8) -> Option<&BlockState> {
         let subchunk_y = block_y_to_subchunk_y(y).ok()?;
         let subchunk = self.data.subchunks.get(&subchunk_y)?;
         let local_y = u8::try_from(y - i32::from(subchunk_y) * 16).ok()?;
-        subchunk
-            .block_state_at(local_x, local_y, local_z)
-            .map(|state| state.name.as_str())
+        subchunk.block_state_at(local_x, local_y, local_z)
+    }
+
+    fn block_entity_at(&self, local_x: u8, y: i32, local_z: u8) -> Option<&RenderBlockEntity> {
+        self.block_entity_index
+            .get(&(local_x, y, local_z))
+            .and_then(|index| self.data.block_entities.get(*index))
     }
 
     fn biome_id_at(&self, local_x: u8, local_z: u8, y: i32) -> Option<u32> {
@@ -3397,13 +4684,14 @@ fn should_try_gpu_compose(
     pixel_count: usize,
     mode: RenderMode,
     surface: SurfaceRenderOptions,
+    gpu: RenderGpuOptions,
 ) -> bool {
     match request {
         RenderBackend::Cpu => false,
         RenderBackend::Gpu => true,
         RenderBackend::Auto => {
             super::gpu::feature_enabled()
-                && pixel_count >= GPU_COMPOSE_MIN_PIXELS
+                && pixel_count >= gpu.min_pixels
                 && lighting_enabled_for(mode, surface)
         }
     }
@@ -3424,35 +4712,76 @@ fn compose_region_tile_cpu(
             if (pixel_count > 4096) && pixel_index.is_multiple_of(4096) {
                 check_cancelled(options)?;
             }
-            let (block_x, block_z) = tile_pixel_to_block(job, pixel_x, pixel_z)?;
-            let color = if let Some(color) = region_color_at_block(
+            let color = region_tile_pixel_color(
+                &renderer.palette,
+                job,
+                options,
+                regions,
+                pixel_x,
+                pixel_z,
+                &mut diagnostics,
+            )?;
+            write_rgba_pixel(&mut rgba, pixel_index, color);
+            pixel_index += 1;
+        }
+    }
+    Ok((rgba, diagnostics))
+}
+
+fn region_tile_pixel_color(
+    palette: &RenderPalette,
+    job: &RenderJob,
+    options: &RenderOptions,
+    regions: &BTreeMap<RegionBakeKey, RegionBake>,
+    pixel_x: u32,
+    pixel_z: u32,
+    diagnostics: &mut RenderDiagnostics,
+) -> Result<RgbaColor> {
+    let bounds = tile_pixel_block_bounds(job, pixel_x, pixel_z)?;
+    if bounds.covers_single_block() {
+        return Ok(region_shaded_color_at_block(
+            palette,
+            regions,
+            options.region_layout,
+            job.coord.dimension,
+            job.mode,
+            bounds.min_x,
+            bounds.min_z,
+            options.surface,
+            Some(BlockBoundaryContext::new(job, pixel_x, pixel_z)),
+        )
+        .unwrap_or_else(|| {
+            diagnostics.missing_chunks = diagnostics.missing_chunks.saturating_add(1);
+            diagnostics.record_transparent_pixel();
+            palette.missing_chunk_color()
+        }));
+    }
+
+    let mut average = RgbaAccumulator::default();
+    for block_z in bounds.min_z..=bounds.max_z {
+        for block_x in bounds.min_x..=bounds.max_x {
+            if let Some(color) = region_shaded_color_at_block(
+                palette,
                 regions,
                 options.region_layout,
                 job.coord.dimension,
                 job.mode,
                 block_x,
                 block_z,
+                options.surface,
+                None,
             ) {
-                shade_region_color(
-                    color,
-                    regions,
-                    options.region_layout,
-                    job.coord.dimension,
-                    job.mode,
-                    block_x,
-                    block_z,
-                    options.surface,
-                )
+                average.add(color);
             } else {
                 diagnostics.missing_chunks = diagnostics.missing_chunks.saturating_add(1);
                 diagnostics.record_transparent_pixel();
-                renderer.palette.missing_chunk_color()
-            };
-            write_rgba_pixel(&mut rgba, pixel_index, color);
-            pixel_index += 1;
+                average.add(palette.missing_chunk_color());
+            }
         }
     }
-    Ok((rgba, diagnostics))
+    Ok(average
+        .average()
+        .unwrap_or_else(|| palette.missing_chunk_color()))
 }
 
 fn prepare_region_tile_compose(
@@ -3568,11 +4897,12 @@ fn push_missing_height_neighborhood(heights: &mut Vec<i32>) {
 }
 
 fn compose_region_tile_from_prepared(
+    palette: &RenderPalette,
     prepared: &PreparedTileCompose,
-    tile_size: u32,
+    job: &RenderJob,
     surface: SurfaceRenderOptions,
 ) -> Vec<u8> {
-    let pixel_count = usize::try_from(tile_size)
+    let pixel_count = usize::try_from(job.tile_size)
         .ok()
         .and_then(|size| size.checked_mul(size))
         .unwrap_or(0);
@@ -3603,7 +4933,20 @@ fn compose_region_tile_from_prepared(
                         .unwrap_or(0)
                         .min(u32::from(u8::MAX)),
                 );
-                color = terrain_lit_color(color, neighborhood, water_depth, surface.lighting);
+                let pixel_x = u32::try_from(pixel_index)
+                    .ok()
+                    .map_or(0, |index| index % job.tile_size);
+                let pixel_z = u32::try_from(pixel_index)
+                    .ok()
+                    .map_or(0, |index| index / job.tile_size);
+                color = surface_lit_color(
+                    palette,
+                    color,
+                    neighborhood,
+                    water_depth,
+                    surface,
+                    Some(BlockBoundaryContext::new(job, pixel_x, pixel_z)),
+                );
             }
         }
         write_rgba_pixel(&mut rgba, pixel_index, color);
@@ -3718,32 +5061,134 @@ fn mode_slug(mode: RenderMode) -> String {
     }
 }
 
+const fn image_format_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::WebP => "webp",
+        ImageFormat::Png => "png",
+        ImageFormat::Rgba => "rgba",
+    }
+}
+
 fn tile_pixel_to_block(job: &RenderJob, pixel_x: u32, pixel_z: u32) -> Result<(i32, i32)> {
-    let tile_span =
-        i64::from(job.tile_size) * i64::from(job.scale) / i64::from(job.pixels_per_block);
-    let pixel_block_x = i64::from(pixel_x)
-        .checked_mul(i64::from(job.scale))
-        .and_then(|value| value.checked_div(i64::from(job.pixels_per_block)))
-        .ok_or_else(|| BedrockRenderError::Validation("tile x coordinate overflow".to_string()))?;
-    let pixel_block_z = i64::from(pixel_z)
-        .checked_mul(i64::from(job.scale))
-        .and_then(|value| value.checked_div(i64::from(job.pixels_per_block)))
-        .ok_or_else(|| BedrockRenderError::Validation("tile z coordinate overflow".to_string()))?;
-    let block_x = i64::from(job.coord.x)
+    let bounds = tile_pixel_block_bounds(job, pixel_x, pixel_z)?;
+    Ok((bounds.min_x, bounds.min_z))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TilePixelBlockBounds {
+    min_x: i32,
+    max_x: i32,
+    min_z: i32,
+    max_z: i32,
+}
+
+impl TilePixelBlockBounds {
+    const fn covers_single_block(self) -> bool {
+        self.min_x == self.max_x && self.min_z == self.max_z
+    }
+}
+
+fn tile_pixels_cover_multiple_blocks(job: &RenderJob) -> bool {
+    job.scale > job.pixels_per_block
+}
+
+fn tile_pixel_block_bounds(
+    job: &RenderJob,
+    pixel_x: u32,
+    pixel_z: u32,
+) -> Result<TilePixelBlockBounds> {
+    let (min_x, max_x) = tile_axis_block_bounds(job.coord.x, pixel_x, job, "x")?;
+    let (min_z, max_z) = tile_axis_block_bounds(job.coord.z, pixel_z, job, "z")?;
+    Ok(TilePixelBlockBounds {
+        min_x,
+        max_x,
+        min_z,
+        max_z,
+    })
+}
+
+fn tile_axis_block_bounds(
+    tile_coord: i32,
+    pixel: u32,
+    job: &RenderJob,
+    axis: &str,
+) -> Result<(i32, i32)> {
+    let scale = i64::from(job.scale);
+    let pixels_per_block = i64::from(job.pixels_per_block);
+    let tile_span = i64::from(job.tile_size)
+        .checked_mul(scale)
+        .and_then(|value| value.checked_div(pixels_per_block))
+        .ok_or_else(|| {
+            BedrockRenderError::Validation(format!("tile {axis} coordinate overflow"))
+        })?;
+    let origin = i64::from(tile_coord)
         .checked_mul(tile_span)
-        .and_then(|value| value.checked_add(pixel_block_x))
-        .ok_or_else(|| BedrockRenderError::Validation("tile x coordinate overflow".to_string()))?;
-    let block_z = i64::from(job.coord.z)
-        .checked_mul(tile_span)
-        .and_then(|value| value.checked_add(pixel_block_z))
-        .ok_or_else(|| BedrockRenderError::Validation("tile z coordinate overflow".to_string()))?;
-    let block_x = i32::try_from(block_x).map_err(|_| {
-        BedrockRenderError::Validation("tile x coordinate is outside i32 range".to_string())
+        .ok_or_else(|| {
+            BedrockRenderError::Validation(format!("tile {axis} coordinate overflow"))
+        })?;
+    let pixel_start = i64::from(pixel)
+        .checked_mul(scale)
+        .and_then(|value| value.checked_div(pixels_per_block))
+        .ok_or_else(|| {
+            BedrockRenderError::Validation(format!("tile {axis} coordinate overflow"))
+        })?;
+    let pixel_end = i64::from(pixel)
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(scale))
+        .and_then(|value| value.checked_sub(1))
+        .and_then(|value| value.checked_div(pixels_per_block))
+        .ok_or_else(|| {
+            BedrockRenderError::Validation(format!("tile {axis} coordinate overflow"))
+        })?;
+    let min = origin.checked_add(pixel_start).ok_or_else(|| {
+        BedrockRenderError::Validation(format!("tile {axis} coordinate overflow"))
     })?;
-    let block_z = i32::try_from(block_z).map_err(|_| {
-        BedrockRenderError::Validation("tile z coordinate is outside i32 range".to_string())
+    let max = origin.checked_add(pixel_end).ok_or_else(|| {
+        BedrockRenderError::Validation(format!("tile {axis} coordinate overflow"))
     })?;
-    Ok((block_x, block_z))
+    let min = i32::try_from(min).map_err(|_| {
+        BedrockRenderError::Validation(format!("tile {axis} coordinate is outside i32 range"))
+    })?;
+    let max = i32::try_from(max).map_err(|_| {
+        BedrockRenderError::Validation(format!("tile {axis} coordinate is outside i32 range"))
+    })?;
+    Ok((min, max))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RgbaAccumulator {
+    red: u64,
+    green: u64,
+    blue: u64,
+    alpha: u64,
+    samples: u64,
+}
+
+impl RgbaAccumulator {
+    fn add(&mut self, color: RgbaColor) {
+        let alpha = u64::from(color.alpha);
+        self.red = self.red.saturating_add(u64::from(color.red) * alpha);
+        self.green = self.green.saturating_add(u64::from(color.green) * alpha);
+        self.blue = self.blue.saturating_add(u64::from(color.blue) * alpha);
+        self.alpha = self.alpha.saturating_add(alpha);
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    fn average(self) -> Option<RgbaColor> {
+        if self.samples == 0 {
+            return None;
+        }
+        if self.alpha == 0 {
+            return Some(RgbaColor::new(0, 0, 0, 0));
+        }
+        let alpha = (self.alpha + self.samples / 2) / self.samples;
+        Some(RgbaColor::new(
+            u8_from_u64((self.red + self.alpha / 2) / self.alpha),
+            u8_from_u64((self.green + self.alpha / 2) / self.alpha),
+            u8_from_u64((self.blue + self.alpha / 2) / self.alpha),
+            u8_from_u64(alpha),
+        ))
+    }
 }
 
 fn write_rgba_pixel(rgba: &mut [u8], pixel_index: usize, color: RgbaColor) {
@@ -3765,8 +5210,194 @@ fn lighting_enabled_for(mode: RenderMode, surface: SurfaceRenderOptions) -> bool
         && matches!(mode, RenderMode::SurfaceBlocks | RenderMode::HeightMap)
 }
 
+fn render_chunk_load_options(mode: RenderMode) -> RenderChunkLoadOptions {
+    let fixed_y = match mode {
+        RenderMode::LayerBlocks { y } | RenderMode::CaveSlice { y } => Some(y),
+        _ => None,
+    };
+    let biome_y = match mode {
+        RenderMode::Biome { y } | RenderMode::RawBiomeLayer { y } => Some(y),
+        _ => Some(64),
+    };
+    let uses_surface = matches!(mode, RenderMode::SurfaceBlocks);
+    let loads_biome_plane = matches!(
+        mode,
+        RenderMode::SurfaceBlocks | RenderMode::Biome { .. } | RenderMode::RawBiomeLayer { .. }
+    );
+    RenderChunkLoadOptions {
+        surface: uses_surface,
+        surface_subchunks: if uses_surface {
+            RenderSurfaceSubchunkMode::Full
+        } else {
+            RenderSurfaceSubchunkMode::Needed
+        },
+        fixed_y,
+        biome_y,
+        load_all_biomes: loads_biome_plane,
+        block_entities: uses_surface,
+        subchunk_decode: SubChunkDecodeMode::FullIndices,
+        threading: WorldThreadingOptions::Single,
+        ..RenderChunkLoadOptions::default()
+    }
+}
+
+fn render_world_cancel(options: &RenderOptions) -> Option<WorldCancelFlag> {
+    options
+        .cancel
+        .as_ref()
+        .map(|cancel| WorldCancelFlag::from_shared(Arc::clone(&cancel.0)))
+}
+
+fn render_chunk_priority_for_region(
+    options: &RenderOptions,
+    region: ChunkRegion,
+) -> RenderChunkPriority {
+    match options.priority {
+        RenderTilePriority::RowMajor => RenderChunkPriority::RowMajor,
+        RenderTilePriority::DistanceFrom { tile_x, tile_z } => {
+            let chunks_per_tile = i32::try_from(region.max_chunk_x - region.min_chunk_x + 1)
+                .unwrap_or(1)
+                .max(1);
+            RenderChunkPriority::DistanceFrom {
+                chunk_x: tile_x.saturating_mul(chunks_per_tile),
+                chunk_z: tile_z.saturating_mul(chunks_per_tile),
+            }
+        }
+    }
+}
+
+fn block_entity_index(data: &RenderChunkData) -> BTreeMap<(u8, i32, u8), usize> {
+    let mut index = BTreeMap::new();
+    for (entity_index, block_entity) in data.block_entities.iter().enumerate() {
+        let Some([x, y, z]) = block_entity.position else {
+            continue;
+        };
+        if x.div_euclid(16) != data.pos.x || z.div_euclid(16) != data.pos.z {
+            continue;
+        }
+        let Ok(local_x) = u8::try_from(x.rem_euclid(16)) else {
+            continue;
+        };
+        let Ok(local_z) = u8::try_from(z.rem_euclid(16)) else {
+            continue;
+        };
+        index.insert((local_x, y, local_z), entity_index);
+    }
+    index
+}
+
+fn baked_tile_pixel_color(
+    palette: &RenderPalette,
+    job: &RenderJob,
+    options: &RenderOptions,
+    bakes: &BTreeMap<ChunkPos, ChunkBake>,
+    pixel_x: u32,
+    pixel_z: u32,
+    diagnostics: &mut RenderDiagnostics,
+) -> Result<RgbaColor> {
+    let bounds = tile_pixel_block_bounds(job, pixel_x, pixel_z)?;
+    if bounds.covers_single_block() {
+        return Ok(chunk_shaded_color_at_block(
+            palette,
+            bakes,
+            job.coord.dimension,
+            job.mode,
+            bounds.min_x,
+            bounds.min_z,
+            options.surface,
+            Some(BlockBoundaryContext::new(job, pixel_x, pixel_z)),
+        )
+        .unwrap_or_else(|| {
+            diagnostics.missing_chunks = diagnostics.missing_chunks.saturating_add(1);
+            diagnostics.record_transparent_pixel();
+            palette.missing_chunk_color()
+        }));
+    }
+
+    let mut average = RgbaAccumulator::default();
+    for block_z in bounds.min_z..=bounds.max_z {
+        for block_x in bounds.min_x..=bounds.max_x {
+            if let Some(color) = chunk_shaded_color_at_block(
+                palette,
+                bakes,
+                job.coord.dimension,
+                job.mode,
+                block_x,
+                block_z,
+                options.surface,
+                None,
+            ) {
+                average.add(color);
+            } else {
+                diagnostics.missing_chunks = diagnostics.missing_chunks.saturating_add(1);
+                diagnostics.record_transparent_pixel();
+                average.add(palette.missing_chunk_color());
+            }
+        }
+    }
+    Ok(average
+        .average()
+        .unwrap_or_else(|| palette.missing_chunk_color()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn region_shaded_color_at_block(
+    palette: &RenderPalette,
+    regions: &BTreeMap<RegionBakeKey, RegionBake>,
+    region_layout: RegionLayout,
+    dimension: Dimension,
+    mode: RenderMode,
+    block_x: i32,
+    block_z: i32,
+    surface: SurfaceRenderOptions,
+    boundary: Option<BlockBoundaryContext>,
+) -> Option<RgbaColor> {
+    let color = region_color_at_block(regions, region_layout, dimension, mode, block_x, block_z)?;
+    Some(shade_region_color(
+        palette,
+        color,
+        regions,
+        region_layout,
+        dimension,
+        mode,
+        block_x,
+        block_z,
+        surface,
+        boundary,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chunk_shaded_color_at_block(
+    palette: &RenderPalette,
+    bakes: &BTreeMap<ChunkPos, ChunkBake>,
+    dimension: Dimension,
+    mode: RenderMode,
+    block_x: i32,
+    block_z: i32,
+    surface: SurfaceRenderOptions,
+    boundary: Option<BlockBoundaryContext>,
+) -> Option<RgbaColor> {
+    let block_pos = BlockPos {
+        x: block_x,
+        y: 0,
+        z: block_z,
+    };
+    let chunk_pos = block_pos.to_chunk_pos(dimension);
+    let (local_x, _, local_z) = block_pos.in_chunk_offset();
+    let bake = bakes.get(&chunk_pos)?;
+    if bake.mode != mode {
+        return None;
+    }
+    let color = chunk_bake_color(bake, u32::from(local_x), u32::from(local_z))?;
+    Some(shade_chunk_bake_color(
+        palette, color, bakes, chunk_pos, local_x, local_z, surface, boundary,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn shade_region_color(
+    palette: &RenderPalette,
     color: RgbaColor,
     regions: &BTreeMap<RegionBakeKey, RegionBake>,
     region_layout: RegionLayout,
@@ -3775,6 +5406,7 @@ fn shade_region_color(
     block_x: i32,
     block_z: i32,
     surface: SurfaceRenderOptions,
+    boundary: Option<BlockBoundaryContext>,
 ) -> RgbaColor {
     if !lighting_enabled_for(mode, surface) {
         return color;
@@ -3795,16 +5427,19 @@ fn shade_region_color(
     );
     let water_depth =
         region_water_depth_at_block(regions, region_layout, dimension, mode, block_x, block_z);
-    terrain_lit_color(color, heights, water_depth, surface.lighting)
+    surface_lit_color(palette, color, heights, water_depth, surface, boundary)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shade_chunk_bake_color(
+    palette: &RenderPalette,
     color: RgbaColor,
     bakes: &BTreeMap<ChunkPos, ChunkBake>,
     chunk_pos: ChunkPos,
     local_x: u8,
     local_z: u8,
     surface: SurfaceRenderOptions,
+    boundary: Option<BlockBoundaryContext>,
 ) -> RgbaColor {
     let Some(bake) = bakes.get(&chunk_pos) else {
         return color;
@@ -3827,7 +5462,7 @@ fn shade_chunk_bake_color(
         height,
     );
     let water_depth = chunk_bake_water_depth(bake, u32::from(local_x), u32::from(local_z));
-    terrain_lit_color(color, heights, water_depth, surface.lighting)
+    surface_lit_color(palette, color, heights, water_depth, surface, boundary)
 }
 
 fn region_color_at_block(
@@ -3976,6 +5611,114 @@ fn chunk_bake_height_neighborhood_at_block(
 }
 
 #[allow(clippy::cast_possible_truncation)]
+fn surface_lit_color(
+    palette: &RenderPalette,
+    color: RgbaColor,
+    heights: TerrainHeightNeighborhood,
+    water_depth: u8,
+    surface: SurfaceRenderOptions,
+    boundary: Option<BlockBoundaryContext>,
+) -> RgbaColor {
+    if shallow_water_skips_lighting(water_depth) {
+        return color;
+    }
+    let lit = terrain_lit_color(color, heights, water_depth, surface.lighting);
+    let moderated = moderate_surface_lighting(palette, color, lit, water_depth, surface);
+    apply_block_boundary_shading(moderated, heights, water_depth, surface, boundary)
+}
+
+fn moderate_surface_lighting(
+    palette: &RenderPalette,
+    base: RgbaColor,
+    lit: RgbaColor,
+    water_depth: u8,
+    surface: SurfaceRenderOptions,
+) -> RgbaColor {
+    if water_depth > 0 {
+        return alpha_blend_surface(base, lit, 72);
+    }
+    if surface.biome_tint && palette.is_biome_surface_color(base) {
+        return alpha_blend_surface(base, lit, 104);
+    }
+    lit
+}
+
+fn shallow_water_skips_lighting(water_depth: u8) -> bool {
+    matches!(water_depth, 1 | 2)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn apply_block_boundary_shading(
+    color: RgbaColor,
+    heights: TerrainHeightNeighborhood,
+    water_depth: u8,
+    surface: SurfaceRenderOptions,
+    boundary: Option<BlockBoundaryContext>,
+) -> RgbaColor {
+    let boundary_options = surface.block_boundaries;
+    if color.alpha == 0
+        || !surface.height_shading
+        || !boundary_options.enabled
+        || boundary_options.strength <= 0.0
+    {
+        return color;
+    }
+    let Some(context) = boundary else {
+        return color;
+    };
+    let Some(line_factor) = block_boundary_line_factor(context, boundary_options) else {
+        return color;
+    };
+    let relief =
+        heights.block_boundary_relief(boundary_options.height_threshold, boundary_options.softness);
+    let water_factor = if water_depth == 0 { 1.0 } else { 0.45 };
+    let flat_shadow = if context.pixels_per_block > 1 {
+        line_factor * boundary_options.flat_strength.max(0.0)
+    } else {
+        0.0
+    };
+    let edge_shadow = relief.shadow * line_factor * boundary_options.strength.max(0.0);
+    let edge_highlight = relief.highlight
+        * line_factor
+        * boundary_options.strength.max(0.0)
+        * boundary_options.highlight_strength.max(0.0)
+        * 100.0
+        * water_factor;
+    let shadow = (flat_shadow + edge_shadow) * boundary_options.max_shadow.max(0.0) * water_factor;
+    let factor = (edge_highlight - shadow)
+        .round()
+        .clamp(-boundary_options.max_shadow.max(0.0), 35.0) as i32;
+    if factor == 0 {
+        return color;
+    }
+    shade_color_percent(color, factor)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn block_boundary_line_factor(
+    context: BlockBoundaryContext,
+    options: BlockBoundaryRenderOptions,
+) -> Option<f32> {
+    if context.blocks_per_pixel != 1 {
+        return None;
+    }
+    if context.pixels_per_block <= 1 {
+        return Some(1.0);
+    }
+    let pixels_per_block = context.pixels_per_block as f32;
+    let local_x = (context.pixel_x % context.pixels_per_block) as f32 + 0.5;
+    let local_z = (context.pixel_z % context.pixels_per_block) as f32 + 0.5;
+    let edge_distance = local_x
+        .min(pixels_per_block - local_x)
+        .min(local_z.min(pixels_per_block - local_z));
+    let width = options
+        .line_width_pixels
+        .clamp(0.25, (pixels_per_block * 0.5).max(0.25));
+    let softness = options.softness.clamp(0.25, 2.0);
+    Some(((width + softness - edge_distance) / softness).clamp(0.0, 1.0))
+}
+
+#[allow(clippy::cast_possible_truncation)]
 fn terrain_lit_color(
     color: RgbaColor,
     heights: TerrainHeightNeighborhood,
@@ -4004,7 +5747,7 @@ fn terrain_lit_color(
         edge_relief_strength *= fade;
     }
     let max_shadow = if water_depth > 0 {
-        70.0
+        lighting.max_shadow.clamp(0.0, 26.0)
     } else {
         lighting.max_shadow.max(0.0)
     };
@@ -4097,6 +5840,10 @@ fn u8_from_u32(value: u32) -> u8 {
     u8::try_from(value).unwrap_or(u8::MAX)
 }
 
+fn u8_from_u64(value: u64) -> u8 {
+    u8::try_from(value.min(u64::from(u8::MAX))).unwrap_or(u8::MAX)
+}
+
 fn u8_from_i32(value: i32) -> u8 {
     u8::try_from(value).unwrap_or(u8::MAX)
 }
@@ -4112,15 +5859,15 @@ fn i16_from_i32(value: i32) -> i16 {
 }
 
 fn tile_chunk_positions(job: &RenderJob) -> Result<Vec<ChunkPos>> {
-    let (start_x, start_z) = tile_pixel_to_block(job, 0, 0)?;
+    let start = tile_pixel_block_bounds(job, 0, 0)?;
     let last_pixel = job.tile_size.checked_sub(1).ok_or_else(|| {
         BedrockRenderError::Validation("tile_size must be greater than zero".to_string())
     })?;
-    let (end_x, end_z) = tile_pixel_to_block(job, last_pixel, last_pixel)?;
-    let min_x = start_x.min(end_x);
-    let max_x = start_x.max(end_x);
-    let min_z = start_z.min(end_z);
-    let max_z = start_z.max(end_z);
+    let end = tile_pixel_block_bounds(job, last_pixel, last_pixel)?;
+    let min_x = start.min_x.min(end.min_x);
+    let max_x = start.max_x.max(end.max_x);
+    let min_z = start.min_z.min(end.min_z);
+    let max_z = start.max_z.max(end.max_z);
     let min_chunk = BlockPos {
         x: min_x,
         y: 0,
@@ -4196,6 +5943,32 @@ fn planned_chunk_positions(planned: &PlannedTile) -> Result<Cow<'_, [ChunkPos]>>
     tile_chunk_positions(&planned.job).map(Cow::Owned)
 }
 
+fn prioritized_planned_tiles(
+    planned_tiles: &[PlannedTile],
+    priority: RenderTilePriority,
+) -> Vec<PlannedTile> {
+    let mut tiles = planned_tiles.to_vec();
+    match priority {
+        RenderTilePriority::RowMajor => {}
+        RenderTilePriority::DistanceFrom { tile_x, tile_z } => {
+            tiles.sort_by_key(|planned| {
+                (
+                    tile_distance_squared(planned.job.coord.x, planned.job.coord.z, tile_x, tile_z),
+                    planned.job.coord.z,
+                    planned.job.coord.x,
+                )
+            });
+        }
+    }
+    tiles
+}
+
+fn tile_distance_squared(x: i32, z: i32, center_x: i32, center_z: i32) -> i64 {
+    let dx = i64::from(x) - i64::from(center_x);
+    let dz = i64::from(z) - i64::from(center_z);
+    dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz))
+}
+
 fn tile_region_keys(
     planned: &PlannedTile,
     region_layout: RegionLayout,
@@ -4256,6 +6029,27 @@ fn select_region_wave(
     Ok(selected)
 }
 
+fn ready_web_tile_indexes(
+    pending_tiles: &[usize],
+    tile_region_keys: &[Vec<RegionBakeKey>],
+    regions: &BTreeMap<RegionBakeKey, RegionBake>,
+    rendered_tiles: &BTreeSet<usize>,
+) -> Result<Vec<usize>> {
+    let mut ready = Vec::new();
+    for index in pending_tiles.iter().copied() {
+        if rendered_tiles.contains(&index) {
+            continue;
+        }
+        let keys = tile_region_keys.get(index).ok_or_else(|| {
+            BedrockRenderError::Validation("missing tile region keys".to_string())
+        })?;
+        if keys.iter().all(|key| regions.contains_key(key)) {
+            ready.push(index);
+        }
+    }
+    Ok(ready)
+}
+
 fn region_estimated_bytes(
     key: RegionBakeKey,
     region_plan_by_key: &BTreeMap<RegionBakeKey, RegionPlan>,
@@ -4294,6 +6088,7 @@ where
                 planned.job.clone(),
                 options,
                 regions,
+                tile_indexes.len(),
             )?;
             stats.add(tile_stats);
             sink(planned.clone(), tile)?;
@@ -4308,13 +6103,14 @@ where
         .max(1);
     let (sender, receiver) =
         mpsc::sync_channel::<Result<(PlannedTile, TileImage, TileComposeStats)>>(queue_capacity);
-    thread::scope(|scope| {
+    let pool = render_cpu_pool(worker_count)?;
+    pool.scope(|scope| {
         for _ in 0..worker_count {
             let next_tile = Arc::clone(&next_tile);
             let sender = sender.clone();
             let renderer = renderer.clone();
             let options = options.clone();
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 loop {
                     if check_cancelled(&options).is_err() {
                         let send_result = sender.send(Err(BedrockRenderError::Cancelled));
@@ -4337,6 +6133,7 @@ where
                             planned.job.clone(),
                             &options,
                             regions,
+                            tile_indexes.len(),
                         )
                         .map(|(tile, stats)| (planned, tile, stats));
                     if sender.send(tile_result).is_err() {
@@ -4354,6 +6151,106 @@ where
         }
         Ok::<TileComposeStats, BedrockRenderError>(stats)
     })
+}
+
+fn collect_tile_chunk_bakes(
+    dependencies: &[ChunkBakeKey],
+    bakes: &BTreeMap<ChunkBakeKey, ChunkBake>,
+) -> Result<(BTreeMap<ChunkPos, ChunkBake>, RenderDiagnostics)> {
+    let mut tile_bakes = BTreeMap::new();
+    let mut diagnostics = RenderDiagnostics::default();
+    for key in dependencies {
+        let bake = bakes.get(key).ok_or_else(|| {
+            BedrockRenderError::Validation("tile dependency was not baked".to_string())
+        })?;
+        diagnostics.add(bake.diagnostics.clone());
+        tile_bakes.insert(key.pos, bake.clone());
+    }
+    Ok((tile_bakes, diagnostics))
+}
+
+fn store_tile_compose_result(
+    message: Result<TileComposeResult>,
+    tiles: &mut [Option<TileImage>],
+    completed_tiles: &mut usize,
+    total_tiles: usize,
+    options: &RenderOptions,
+) -> Result<()> {
+    let result = message?;
+    let slot = tiles.get_mut(result.tile_index).ok_or_else(|| {
+        BedrockRenderError::Validation("tile compose result index is out of range".to_string())
+    })?;
+    if slot.is_some() {
+        return Err(BedrockRenderError::Validation(
+            "duplicate tile compose result".to_string(),
+        ));
+    }
+    *slot = Some(result.tile);
+    *completed_tiles = completed_tiles.saturating_add(1);
+    emit_progress(options, *completed_tiles, total_tiles);
+    Ok(())
+}
+
+fn pipeline_queue_capacity(options: &RenderOptions, worker_count: usize) -> usize {
+    options
+        .cpu
+        .resolve_queue_depth(worker_count, worker_count)
+        .max(
+            options
+                .pipeline_depth
+                .max(worker_count.saturating_mul(2))
+                .max(1),
+        )
+}
+
+fn render_cpu_pool(worker_count: usize) -> Result<rayon::ThreadPool> {
+    ThreadPoolBuilder::new()
+        .num_threads(worker_count.max(1).saturating_add(1))
+        .thread_name(|index| format!("bedrock-render-cpu-{index}"))
+        .build()
+        .map_err(|error| {
+            BedrockRenderError::Validation(format!("failed to build render CPU pool: {error}"))
+        })
+}
+
+fn pipeline_loader_count(worker_count: usize, work_items: usize) -> usize {
+    if work_items == 0 {
+        return 0;
+    }
+    if worker_count < 3 {
+        return 1.min(work_items);
+    }
+    (worker_count / 2)
+        .clamp(1, worker_count.saturating_sub(2))
+        .min(work_items)
+}
+
+fn pipeline_compose_count(worker_count: usize, loader_count: usize, work_items: usize) -> usize {
+    if work_items == 0 || worker_count <= loader_count.saturating_add(1) {
+        return 0;
+    }
+    worker_count
+        .saturating_sub(loader_count)
+        .saturating_div(2)
+        .max(1)
+        .min(worker_count.saturating_sub(loader_count).saturating_sub(1))
+        .min(work_items)
+}
+
+fn pipeline_bake_count(
+    worker_count: usize,
+    loader_count: usize,
+    compose_count: usize,
+    work_items: usize,
+) -> usize {
+    if work_items == 0 {
+        return 0;
+    }
+    worker_count
+        .saturating_sub(loader_count)
+        .saturating_sub(compose_count)
+        .max(1)
+        .min(work_items)
 }
 
 fn empty_region_payload(
@@ -4486,13 +6383,14 @@ where
     let total_tasks = tasks.len();
     let next_task = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = mpsc::channel::<Result<R>>();
-    thread::scope(|scope| {
+    let pool = render_cpu_pool(worker_count)?;
+    pool.scope(|scope| {
         for _ in 0..worker_count {
             let next_task = Arc::clone(&next_task);
             let sender = sender.clone();
             let options = options.clone();
             let tasks = &tasks;
-            scope.spawn(move || {
+            scope.spawn(move |_| {
                 loop {
                     if check_cancelled(&options).is_err() {
                         let send_result = sender.send(Err(BedrockRenderError::Cancelled));
@@ -4522,6 +6420,395 @@ where
     })
 }
 
+fn state_block_color(palette: &RenderPalette, state: &BlockState) -> RgbaColor {
+    palette.block_state_color(state)
+}
+
+fn state_surface_block_color(
+    palette: &RenderPalette,
+    state: &BlockState,
+    biome_id: Option<u32>,
+    biome_tint: bool,
+) -> RgbaColor {
+    palette.surface_block_state_color(state, biome_id, biome_tint)
+}
+
+fn special_surface_block_color(
+    palette: &RenderPalette,
+    state: &BlockState,
+    block_entity: Option<&RenderBlockEntity>,
+    biome_id: Option<u32>,
+    biome_tint: bool,
+) -> RgbaColor {
+    let base = state_surface_block_color(palette, state, biome_id, biome_tint);
+    let short_name = state.name.strip_prefix("minecraft:").unwrap_or(&state.name);
+    match short_name {
+        "pistonArmCollision" | "piston_arm_collision" => palette
+            .block_variant_color(&state.name, "piston_arm")
+            .map(|color| with_opaque_alpha(color))
+            .unwrap_or(base),
+        "stickyPistonArmCollision" | "sticky_piston_arm_collision" => palette
+            .block_variant_color(&state.name, "sticky_piston_arm")
+            .or_else(|| palette.block_variant_color("minecraft:pistonArmCollision", "piston_arm"))
+            .map(|color| with_opaque_alpha(color))
+            .unwrap_or(base),
+        "movingBlock" | "moving_block" => block_entity
+            .and_then(moving_block_state_from_entity)
+            .map(|moving_state| {
+                palette.surface_block_state_color(&moving_state, biome_id, biome_tint)
+            })
+            .or_else(|| {
+                palette
+                    .block_variant_color("minecraft:pistonArmCollision", "piston_arm")
+                    .map(with_opaque_alpha)
+            })
+            .unwrap_or(base),
+        "standing_banner" | "wall_banner" => {
+            banner_surface_color(palette, &state.name, base, block_entity)
+        }
+        "decorated_pot" => decorated_pot_surface_color(palette, &state.name, base, block_entity),
+        _ => base,
+    }
+}
+
+fn banner_surface_color(
+    palette: &RenderPalette,
+    block_name: &str,
+    base: RgbaColor,
+    block_entity: Option<&RenderBlockEntity>,
+) -> RgbaColor {
+    let mut color = block_entity
+        .and_then(banner_base_variant)
+        .and_then(|variant| palette.block_variant_color(block_name, &variant))
+        .or_else(|| palette.block_variant_color(block_name, "banner_base_white"))
+        .map(with_opaque_alpha)
+        .unwrap_or(base);
+    if let Some(block_entity) = block_entity {
+        for variant in banner_pattern_variants(block_entity).into_iter().take(8) {
+            if let Some(pattern_color) = palette.block_variant_color(block_name, &variant) {
+                color = alpha_blend_surface(with_opaque_alpha(pattern_color), color, 54);
+            }
+        }
+    }
+    color
+}
+
+fn decorated_pot_surface_color(
+    palette: &RenderPalette,
+    block_name: &str,
+    base: RgbaColor,
+    block_entity: Option<&RenderBlockEntity>,
+) -> RgbaColor {
+    let mut color = palette
+        .block_variant_color(block_name, "decorated_pot_base")
+        .map(with_opaque_alpha)
+        .unwrap_or(base);
+    if let Some(block_entity) = block_entity {
+        for variant in decorated_pot_sherd_variants(block_entity)
+            .into_iter()
+            .take(4)
+        {
+            if let Some(sherd_color) = palette.block_variant_color(block_name, &variant) {
+                color = alpha_blend_surface(with_opaque_alpha(sherd_color), color, 70);
+            }
+        }
+    }
+    color
+}
+
+fn with_opaque_alpha(color: RgbaColor) -> RgbaColor {
+    RgbaColor::new(color.red, color.green, color.blue, 255)
+}
+
+fn moving_block_state_from_entity(block_entity: &RenderBlockEntity) -> Option<BlockState> {
+    find_block_state_in_nbt(&block_entity.nbt, 0)
+}
+
+fn find_block_state_in_nbt(tag: &NbtTag, depth: usize) -> Option<BlockState> {
+    if depth > 6 {
+        return None;
+    }
+    let root = nbt_compound(tag)?;
+    for key in [
+        "movingBlock",
+        "moving_block",
+        "blockState",
+        "BlockState",
+        "block_state",
+        "Block",
+        "block",
+    ] {
+        if let Some(candidate) = root.get(key).and_then(|tag| block_state_from_nbt(tag)) {
+            return Some(candidate);
+        }
+    }
+    if let Some(candidate) = block_state_from_nbt(tag) {
+        return Some(candidate);
+    }
+    for value in root.values() {
+        if let Some(candidate) = find_block_state_in_nbt(value, depth + 1) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn block_state_from_nbt(tag: &NbtTag) -> Option<BlockState> {
+    let root = nbt_compound(tag)?;
+    let name = nbt_string_field(root, "name")
+        .or_else(|| nbt_string_field(root, "Name"))
+        .or_else(|| nbt_string_field(root, "identifier"))
+        .or_else(|| nbt_string_field(root, "Identifier"))?;
+    let states = root
+        .get("states")
+        .or_else(|| root.get("States"))
+        .and_then(nbt_compound)
+        .map(|states| {
+            states
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let version = nbt_int_field(root, "version").or_else(|| nbt_int_field(root, "Version"));
+    Some(BlockState {
+        name: normalize_nbt_block_name(name),
+        states,
+        version,
+    })
+}
+
+fn banner_base_variant(block_entity: &RenderBlockEntity) -> Option<String> {
+    let root = nbt_compound(&block_entity.nbt)?;
+    nbt_string_field(root, "Base")
+        .or_else(|| nbt_string_field(root, "base"))
+        .or_else(|| nbt_string_field(root, "BaseColor"))
+        .or_else(|| nbt_string_field(root, "Color"))
+        .or_else(|| nbt_string_field(root, "color"))
+        .map(banner_variant_from_color_name)
+        .or_else(|| {
+            nbt_int_field(root, "Base")
+                .or_else(|| nbt_int_field(root, "base"))
+                .or_else(|| nbt_int_field(root, "BaseColor"))
+                .or_else(|| nbt_int_field(root, "Color"))
+                .or_else(|| nbt_int_field(root, "color"))
+                .and_then(banner_variant_from_color_id)
+        })
+}
+
+fn banner_pattern_variants(block_entity: &RenderBlockEntity) -> Vec<String> {
+    let Some(root) = nbt_compound(&block_entity.nbt) else {
+        return Vec::new();
+    };
+    let Some(NbtTag::List(patterns)) = root.get("Patterns").or_else(|| root.get("patterns")) else {
+        return Vec::new();
+    };
+    patterns
+        .iter()
+        .filter_map(|pattern| {
+            let pattern = nbt_compound(pattern)?;
+            nbt_int_field(pattern, "Color")
+                .or_else(|| nbt_int_field(pattern, "color"))
+                .and_then(banner_variant_from_color_id)
+                .or_else(|| {
+                    nbt_string_field(pattern, "Color")
+                        .or_else(|| nbt_string_field(pattern, "color"))
+                        .map(banner_variant_from_color_name)
+                })
+        })
+        .collect()
+}
+
+fn decorated_pot_sherd_variants(block_entity: &RenderBlockEntity) -> Vec<String> {
+    let Some(root) = nbt_compound(&block_entity.nbt) else {
+        return Vec::new();
+    };
+    let Some(NbtTag::List(sherds)) = root
+        .get("sherds")
+        .or_else(|| root.get("Sherds"))
+        .or_else(|| root.get("shards"))
+        .or_else(|| root.get("Shards"))
+    else {
+        return Vec::new();
+    };
+    sherds
+        .iter()
+        .filter_map(|sherd| match sherd {
+            NbtTag::String(value) => Some(decorated_pot_variant_from_sherd(value)),
+            NbtTag::Compound(root) => nbt_string_field(root, "Name")
+                .or_else(|| nbt_string_field(root, "name"))
+                .map(decorated_pot_variant_from_sherd),
+            _ => None,
+        })
+        .collect()
+}
+
+fn banner_variant_from_color_id(id: i32) -> Option<String> {
+    let color = match id {
+        0 => "white",
+        1 => "orange",
+        2 => "magenta",
+        3 => "light_blue",
+        4 => "yellow",
+        5 => "lime",
+        6 => "pink",
+        7 => "gray",
+        8 => "light_gray",
+        9 => "cyan",
+        10 => "purple",
+        11 => "blue",
+        12 => "brown",
+        13 => "green",
+        14 => "red",
+        15 => "black",
+        _ => return None,
+    };
+    Some(format!("banner_base_{color}"))
+}
+
+fn banner_variant_from_color_name(name: &str) -> String {
+    format!("banner_base_{}", normalize_variant_token(name))
+}
+
+fn decorated_pot_variant_from_sherd(name: &str) -> String {
+    let token = normalize_variant_token(name)
+        .trim_end_matches("_pottery_sherd")
+        .trim_end_matches("_sherd")
+        .to_string();
+    format!("decorated_pot_{token}")
+}
+
+fn normalize_variant_token(name: &str) -> String {
+    name.strip_prefix("minecraft:")
+        .unwrap_or(name)
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', ':'], "_")
+}
+
+fn normalize_nbt_block_name(name: &str) -> String {
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{name}")
+    }
+}
+
+fn nbt_compound(tag: &NbtTag) -> Option<&indexmap::IndexMap<String, NbtTag>> {
+    match tag {
+        NbtTag::Compound(root) => Some(root),
+        _ => None,
+    }
+}
+
+fn nbt_string_field<'a>(
+    root: &'a indexmap::IndexMap<String, NbtTag>,
+    key: &str,
+) -> Option<&'a str> {
+    match root.get(key) {
+        Some(NbtTag::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn nbt_int_field(root: &indexmap::IndexMap<String, NbtTag>, key: &str) -> Option<i32> {
+    match root.get(key) {
+        Some(NbtTag::Byte(value)) => Some(i32::from(*value)),
+        Some(NbtTag::Short(value)) => Some(i32::from(*value)),
+        Some(NbtTag::Int(value)) => Some(*value),
+        Some(NbtTag::Long(value)) => i32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn surface_overlay_alpha(name: &str) -> Option<u8> {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    if name.contains("carpet") {
+        return None;
+    }
+    if matches!(
+        name,
+        "short_grass" | "tallgrass" | "tall_grass" | "fern" | "large_fern" | "vine"
+    ) || name.contains("vine")
+    {
+        return Some(82);
+    }
+    if matches!(
+        name,
+        "deadbush"
+            | "dead_bush"
+            | "brown_mushroom"
+            | "red_mushroom"
+            | "poppy"
+            | "dandelion"
+            | "blue_orchid"
+            | "allium"
+            | "azure_bluet"
+            | "oxeye_daisy"
+            | "cornflower"
+            | "lily_of_the_valley"
+            | "wither_rose"
+            | "torchflower"
+    ) || name.contains("flower")
+        || name.contains("sapling")
+        || name.contains("bush")
+        || name.contains("petals")
+        || name.contains("tulip")
+    {
+        return Some(115);
+    }
+    if matches!(
+        name,
+        "tripWire"
+            | "trip_wire"
+            | "tripwire_hook"
+            | "redstone_wire"
+            | "rail"
+            | "detector_rail"
+            | "activator_rail"
+            | "golden_rail"
+    ) {
+        return Some(130);
+    }
+    if matches!(
+        name,
+        "torch"
+            | "redstone_torch"
+            | "unlit_redstone_torch"
+            | "soul_torch"
+            | "copper_torch"
+            | "lever"
+    ) || name.contains("button")
+        || name.contains("pressure_plate")
+    {
+        return Some(155);
+    }
+    None
+}
+
+fn blend_surface_overlay(base: RgbaColor, overlay: Option<SurfaceOverlay>) -> RgbaColor {
+    let Some(overlay) = overlay else {
+        return base;
+    };
+    alpha_blend_surface(overlay.color, base, overlay.alpha)
+}
+
+fn alpha_blend_surface(foreground: RgbaColor, background: RgbaColor, alpha: u8) -> RgbaColor {
+    let alpha = u16::from(alpha);
+    let inverse = 255_u16.saturating_sub(alpha);
+    RgbaColor::new(
+        blend_surface_channel(foreground.red, background.red, alpha, inverse),
+        blend_surface_channel(foreground.green, background.green, alpha, inverse),
+        blend_surface_channel(foreground.blue, background.blue, alpha, inverse),
+        255,
+    )
+}
+
+fn blend_surface_channel(foreground: u8, background: u8, alpha: u16, inverse: u16) -> u8 {
+    let value = ((u16::from(foreground) * alpha) + (u16::from(background) * inverse)) / 255;
+    u8::try_from(value).unwrap_or(u8::MAX)
+}
+
 fn block_y_to_subchunk_y(y: i32) -> Result<i8> {
     i8::try_from(y.div_euclid(16)).map_err(|_| {
         BedrockRenderError::Validation(format!(
@@ -4532,14 +6819,16 @@ fn block_y_to_subchunk_y(y: i32) -> Result<i8> {
 
 #[allow(dead_code)]
 fn block_name_at(subchunk: &SubChunk, block_pos: BlockPos) -> Option<&str> {
+    block_state_at(subchunk, block_pos).map(|state| state.name.as_str())
+}
+
+fn block_state_at(subchunk: &SubChunk, block_pos: BlockPos) -> Option<&BlockState> {
     let (local_x, y, local_z) = block_pos.in_chunk_offset();
     let local_y = u8::try_from(y - i32::from(subchunk.y) * 16).ok()?;
     if local_y >= 16 {
         return None;
     }
-    subchunk
-        .block_state_at(local_x, local_y, local_z)
-        .map(|state| state.name.as_str())
+    subchunk.block_state_at(local_x, local_y, local_z)
 }
 
 fn biome_storage_bucket_y(y: i32) -> i32 {
@@ -4667,6 +6956,32 @@ mod tests {
         }
     }
 
+    fn planned_tile_at(x: i32, z: i32) -> PlannedTile {
+        let layout = ChunkTileLayout::default();
+        let job = RenderJob::chunk_tile(
+            TileCoord {
+                x,
+                z,
+                dimension: Dimension::Overworld,
+            },
+            RenderMode::SurfaceBlocks,
+            layout,
+        )
+        .expect("render job");
+        PlannedTile {
+            job,
+            region: ChunkRegion::new(
+                Dimension::Overworld,
+                x.saturating_mul(16),
+                z.saturating_mul(16),
+                x.saturating_mul(16).saturating_add(15),
+                z.saturating_mul(16).saturating_add(15),
+            ),
+            layout,
+            chunk_positions: None,
+        }
+    }
+
     #[test]
     fn render_threading_validates_fixed_range_and_auto_is_not_capped_to_eight() {
         let expected_auto = std::thread::available_parallelism()
@@ -4707,6 +7022,98 @@ mod tests {
                 .expect("interactive threads"),
             expected_interactive
         );
+    }
+
+    #[test]
+    fn distance_priority_orders_planned_tiles_from_view_center() {
+        let planned = vec![
+            planned_tile_at(8, 0),
+            planned_tile_at(1, 0),
+            planned_tile_at(-2, 0),
+            planned_tile_at(0, 0),
+        ];
+        let ordered = prioritized_planned_tiles(
+            &planned,
+            RenderTilePriority::DistanceFrom {
+                tile_x: 0,
+                tile_z: 0,
+            },
+        );
+
+        let coords = ordered
+            .iter()
+            .map(|planned| (planned.job.coord.x, planned.job.coord.z))
+            .collect::<Vec<_>>();
+        assert_eq!(coords, vec![(0, 0), (1, 0), (-2, 0), (8, 0)]);
+    }
+
+    #[test]
+    fn render_gpu_options_resolve_new_auto_fields() {
+        let options = RenderGpuOptions::default();
+
+        assert_eq!(
+            options.resolve_submit_workers(3),
+            3,
+            "submit workers should follow the in-flight budget by default"
+        );
+        assert_eq!(
+            options.resolve_batch_pixels(RenderExecutionProfile::Interactive),
+            512 * 512
+        );
+        assert_eq!(
+            options.resolve_batch_pixels(RenderExecutionProfile::Export),
+            1024 * 1024
+        );
+        assert!(options.resolve_buffer_pool_bytes(RenderExecutionProfile::Interactive) > 0);
+        assert!(options.resolve_staging_pool_bytes(RenderExecutionProfile::Export) > 0);
+    }
+
+    #[test]
+    fn block_state_overrides_crop_growth_and_farmland_moisture() {
+        let young_wheat =
+            test_block_state("minecraft:wheat", [("growth", NbtTag::Int(0))].into_iter());
+        let mature_wheat =
+            test_block_state("minecraft:wheat", [("growth", NbtTag::Int(7))].into_iter());
+        let dry_farmland = test_block_state(
+            "minecraft:farmland",
+            [("moisturized_amount", NbtTag::Int(0))].into_iter(),
+        );
+        let wet_farmland = test_block_state(
+            "minecraft:farmland",
+            [("moisturized_amount", NbtTag::Int(7))].into_iter(),
+        );
+
+        let young = state_block_color(&RenderPalette::default(), &young_wheat);
+        let mature = state_block_color(&RenderPalette::default(), &mature_wheat);
+        let dry = state_block_color(&RenderPalette::default(), &dry_farmland);
+        let wet = state_block_color(&RenderPalette::default(), &wet_farmland);
+
+        assert!(mature.red > young.red);
+        assert!(mature.green >= young.green);
+        assert!(mature.blue > young.blue);
+        assert!(rgba_color_distance(young, mature) >= 120);
+        assert!(dry.red > wet.red);
+        assert!(dry.green > wet.green);
+        assert!(rgba_color_distance(dry, wet) >= 100);
+    }
+
+    #[test]
+    fn block_state_overrides_horizontal_log_axis() {
+        let vertical = test_block_state(
+            "minecraft:oak_log",
+            [("pillar_axis", NbtTag::String("y".to_string()))].into_iter(),
+        );
+        let horizontal = test_block_state(
+            "minecraft:oak_log",
+            [("pillar_axis", NbtTag::String("x".to_string()))].into_iter(),
+        );
+
+        let palette = RenderPalette::default();
+        let vertical_color = state_block_color(&palette, &vertical);
+        let horizontal_color = state_block_color(&palette, &horizontal);
+
+        assert_ne!(vertical_color, horizontal_color);
+        assert!(rgba_color_distance(vertical_color, horizontal_color) >= 40);
     }
 
     #[test]
@@ -4969,13 +7376,13 @@ mod tests {
         let base = RgbaColor::new(100, 100, 100, 255);
         let soft = terrain_lit_color(
             base,
-            cardinal_heights(64, 72, 64, 64),
+            cardinal_heights(64, 88, 64, 64),
             0,
             TerrainLightingOptions::soft(),
         );
         let strong = terrain_lit_color(
             base,
-            cardinal_heights(64, 72, 64, 64),
+            cardinal_heights(64, 88, 64, 64),
             0,
             TerrainLightingOptions::strong(),
         );
@@ -5106,7 +7513,225 @@ mod tests {
     }
 
     #[test]
-    fn land_shadow_limit_does_not_reduce_underwater_relief() {
+    fn block_boundaries_off_preserves_surface_lighting() {
+        let palette = RenderPalette::default();
+        let base = RgbaColor::new(120, 120, 120, 255);
+        let heights = uniform_neighbor_heights(64, 64);
+        let mut surface = SurfaceRenderOptions {
+            block_boundaries: BlockBoundaryRenderOptions::off(),
+            ..SurfaceRenderOptions::default()
+        };
+        surface.lighting.edge_relief_strength = 0.0;
+        let without_boundary = surface_lit_color(&palette, base, heights, 0, surface, None);
+        let with_disabled_boundary = surface_lit_color(
+            &palette,
+            base,
+            heights,
+            0,
+            surface,
+            Some(BlockBoundaryContext {
+                pixel_x: 0,
+                pixel_z: 0,
+                pixels_per_block: 4,
+                blocks_per_pixel: 1,
+            }),
+        );
+
+        assert_eq!(without_boundary, with_disabled_boundary);
+    }
+
+    #[test]
+    fn flat_block_boundary_adds_subtle_grid_shadow() {
+        let palette = RenderPalette::default();
+        let base = RgbaColor::new(140, 140, 140, 255);
+        let surface = SurfaceRenderOptions {
+            lighting: TerrainLightingOptions::off(),
+            block_boundaries: BlockBoundaryRenderOptions {
+                flat_strength: 0.35,
+                max_shadow: 16.0,
+                ..BlockBoundaryRenderOptions::default()
+            },
+            ..SurfaceRenderOptions::default()
+        };
+        let shaded = surface_lit_color(
+            &palette,
+            base,
+            uniform_neighbor_heights(64, 64),
+            0,
+            surface,
+            Some(BlockBoundaryContext {
+                pixel_x: 0,
+                pixel_z: 0,
+                pixels_per_block: 4,
+                blocks_per_pixel: 1,
+            }),
+        );
+
+        assert!(shaded.red < base.red);
+        assert!(base.red - shaded.red <= 12);
+    }
+
+    #[test]
+    fn block_boundary_contact_shadow_emphasizes_height_step() {
+        let palette = RenderPalette::default();
+        let base = RgbaColor::new(140, 140, 140, 255);
+        let mut no_boundary = SurfaceRenderOptions {
+            block_boundaries: BlockBoundaryRenderOptions::off(),
+            ..SurfaceRenderOptions::default()
+        };
+        no_boundary.lighting.edge_relief_strength = 0.0;
+        let with_boundary = SurfaceRenderOptions {
+            block_boundaries: BlockBoundaryRenderOptions {
+                strength: 1.0,
+                flat_strength: 0.0,
+                max_shadow: 18.0,
+                height_threshold: 1.0,
+                ..BlockBoundaryRenderOptions::default()
+            },
+            ..no_boundary
+        };
+        let heights = uniform_neighbor_heights(48, 72);
+        let baseline = surface_lit_color(
+            &palette,
+            base,
+            heights,
+            0,
+            no_boundary,
+            Some(BlockBoundaryContext {
+                pixel_x: 0,
+                pixel_z: 0,
+                pixels_per_block: 1,
+                blocks_per_pixel: 1,
+            }),
+        );
+        let shaded = surface_lit_color(
+            &palette,
+            base,
+            heights,
+            0,
+            with_boundary,
+            Some(BlockBoundaryContext {
+                pixel_x: 0,
+                pixel_z: 0,
+                pixels_per_block: 1,
+                blocks_per_pixel: 1,
+            }),
+        );
+
+        assert!(shaded.red < baseline.red);
+    }
+
+    #[test]
+    fn block_boundary_threshold_ignores_small_height_noise() {
+        let palette = RenderPalette::default();
+        let base = RgbaColor::new(140, 140, 140, 255);
+        let surface = SurfaceRenderOptions {
+            block_boundaries: BlockBoundaryRenderOptions {
+                strength: 1.0,
+                flat_strength: 0.0,
+                height_threshold: 3.0,
+                ..BlockBoundaryRenderOptions::default()
+            },
+            ..SurfaceRenderOptions::default()
+        };
+        let without_boundary = SurfaceRenderOptions {
+            block_boundaries: BlockBoundaryRenderOptions::off(),
+            ..surface
+        };
+        let heights = uniform_neighbor_heights(64, 66);
+        let baseline = surface_lit_color(
+            &palette,
+            base,
+            heights,
+            0,
+            without_boundary,
+            Some(BlockBoundaryContext {
+                pixel_x: 0,
+                pixel_z: 0,
+                pixels_per_block: 1,
+                blocks_per_pixel: 1,
+            }),
+        );
+        let shaded = surface_lit_color(
+            &palette,
+            base,
+            heights,
+            0,
+            surface,
+            Some(BlockBoundaryContext {
+                pixel_x: 0,
+                pixel_z: 0,
+                pixels_per_block: 1,
+                blocks_per_pixel: 1,
+            }),
+        );
+
+        assert_eq!(baseline, shaded);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_compose_reports_scheduler_stats_or_fallback_reason() {
+        let width = 16_u32;
+        let height = 16_u32;
+        let pixel_count = usize::try_from(width * height).expect("pixel count");
+        let colors = vec![pack_rgba_color(RgbaColor::new(120, 120, 120, 255)); pixel_count];
+        let heights = vec![64_i32; pixel_count * 9];
+        let water_depths = vec![0_u32; pixel_count];
+        let input = GpuTileComposeInput {
+            width,
+            height,
+            pixels_per_block: 2,
+            blocks_per_pixel: 1,
+            colors: &colors,
+            heights: &heights,
+            water_depths: &water_depths,
+            lighting_enabled: true,
+            lighting: TerrainLightingOptions::soft(),
+            block_boundaries: BlockBoundaryRenderOptions::default(),
+            max_in_flight: 2,
+            batch_size: 2,
+            readback_workers: 2,
+            submit_workers: 2,
+            batch_pixels: pixel_count,
+            buffer_pool_bytes: 1024 * 1024,
+            staging_pool_bytes: 1024 * 1024,
+        };
+
+        match super::super::gpu::compose_tile(&input) {
+            Ok(output) => {
+                assert_eq!(output.rgba.len(), pixel_count * 4);
+                assert_eq!(output.batches, 1);
+                assert_eq!(output.batch_tiles, 1);
+                assert_eq!(output.max_in_flight, 2);
+                assert_eq!(output.worker_threads, 2);
+                assert_eq!(output.submit_workers, 2);
+                assert_eq!(
+                    output.buffer_reuses + output.buffer_allocations,
+                    4,
+                    "color/height/water/output buffers should be accounted"
+                );
+                assert_eq!(
+                    output.staging_reuses + output.staging_allocations,
+                    1,
+                    "readback staging buffer should be accounted"
+                );
+                assert!(!output.adapter_name.is_empty());
+                if let Ok(second) = super::super::gpu::compose_tile(&input) {
+                    assert!(
+                        second.buffer_reuses > 0 || second.staging_reuses > 0,
+                        "second GPU compose should be able to reuse pooled buffers"
+                    );
+                }
+            }
+            Err(reason) => {
+                assert!(!reason.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_limit_caps_underwater_relief() {
         let base = RgbaColor::new(100, 100, 100, 255);
         let mut capped = TerrainLightingOptions::strong();
         capped.max_shadow = 1.0;
@@ -5115,7 +7740,7 @@ mod tests {
         let capped_water = terrain_lit_color(base, cardinal_heights(72, 64, 64, 64), 1, capped);
         let normal_water = terrain_lit_color(base, cardinal_heights(72, 64, 64, 64), 1, normal);
 
-        assert_eq!(capped_water, normal_water);
+        assert!(capped_water.red > normal_water.red);
     }
 
     #[test]
@@ -5193,6 +7818,88 @@ mod tests {
     }
 
     #[test]
+    fn render_tiles_shared_bake_pipeline_preserves_output_order() {
+        let storage = Arc::new(MemoryStorage::new());
+        for (chunk_x, block_name) in [
+            (0, "minecraft:first_batch_test"),
+            (1, "minecraft:second_batch_test"),
+        ] {
+            let pos = ChunkPos {
+                x: chunk_x,
+                z: 0,
+                dimension: Dimension::Overworld,
+            };
+            storage
+                .put(
+                    &ChunkKey::subchunk(pos, 4).encode(),
+                    &test_surface_subchunk_bytes_with_values(
+                        [("minecraft:air", 0_u16), (block_name, 1)],
+                        |_, _, local_y| u16::from(local_y == 0),
+                    ),
+                )
+                .expect("put subchunk");
+        }
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let renderer = MapRenderer::new(
+            world,
+            RenderPalette::default()
+                .with_block_color(
+                    "minecraft:first_batch_test",
+                    RgbaColor::new(180, 20, 30, 255),
+                )
+                .with_block_color(
+                    "minecraft:second_batch_test",
+                    RgbaColor::new(20, 40, 190, 255),
+                ),
+        );
+        let jobs = [1, 0, 1].map(|tile_x| RenderJob {
+            coord: TileCoord {
+                x: tile_x,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            tile_size: 16,
+            ..RenderJob::new(
+                TileCoord {
+                    x: 0,
+                    z: 0,
+                    dimension: Dimension::Overworld,
+                },
+                RenderMode::LayerBlocks { y: 64 },
+            )
+        });
+
+        let tiles = renderer
+            .render_tiles_blocking(
+                jobs,
+                RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Fixed(4),
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render batch");
+
+        assert_eq!(tiles.len(), 3);
+        assert_eq!(tiles[0].coord.x, 1);
+        assert_eq!(tiles[1].coord.x, 0);
+        assert_eq!(tiles[2].coord.x, 1);
+        assert_eq!(
+            pixel_rgba(&tiles[0].rgba, tiles[0].width, 0, 0),
+            [20, 40, 190, 255]
+        );
+        assert_eq!(
+            pixel_rgba(&tiles[1].rgba, tiles[1].width, 0, 0),
+            [180, 20, 30, 255]
+        );
+        assert_eq!(tiles[0].rgba, tiles[2].rgba);
+    }
+
+    #[test]
     fn pixels_per_block_renders_repeated_source_blocks() {
         let pos = ChunkPos {
             x: 0,
@@ -5239,6 +7946,493 @@ mod tests {
         assert_eq!(&tile.rgba[16..20], &[10, 0, 0, 255]);
         assert_eq!(&tile.rgba[20..24], &[10, 0, 0, 255]);
         assert_eq!(&tile.rgba[32..36], &[0, 10, 0, 255]);
+    }
+
+    #[test]
+    fn surface_blocks_blend_thin_overlay_with_support_block() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 4),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes_with_values(
+                    [
+                        ("minecraft:air", 0_u16),
+                        ("minecraft:stone", 1),
+                        ("minecraft:grass_block", 2),
+                        ("minecraft:stone_button", 3),
+                    ],
+                    |_, _, local_y| match local_y {
+                        0 => 1,
+                        1 => 2,
+                        2 => 3,
+                        _ => 0,
+                    },
+                ),
+            )
+            .expect("put subchunk");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default()
+            .with_block_color("minecraft:stone", RgbaColor::new(10, 10, 10, 255))
+            .with_block_color("minecraft:stone_button", RgbaColor::new(90, 90, 90, 255))
+            .with_block_color("minecraft:grass_block", RgbaColor::new(20, 200, 20, 255));
+        let support = palette.surface_block_color("minecraft:grass_block", None, false);
+        let overlay = palette.surface_block_color("minecraft:stone_button", None, false);
+        let expected = alpha_blend_surface(
+            overlay,
+            support,
+            surface_overlay_alpha("minecraft:stone_button").expect("button overlay alpha"),
+        )
+        .to_array();
+        let renderer = MapRenderer::new(world, palette);
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 1,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        biome_tint: false,
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render surface overlay");
+
+        assert_eq!(&tile.rgba[0..4], &expected);
+        assert_ne!(&tile.rgba[0..4], &support.to_array());
+        assert_ne!(&tile.rgba[0..4], &overlay.to_array());
+    }
+
+    #[test]
+    fn surface_blocks_keep_bedrock_grass_block_id() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 4),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes_with_values(
+                    [
+                        ("minecraft:air", 0_u16),
+                        ("minecraft:dirt", 1),
+                        ("minecraft:grass", 2),
+                    ],
+                    |_, _, local_y| match local_y {
+                        0 => 1,
+                        1 => 2,
+                        _ => 0,
+                    },
+                ),
+            )
+            .expect("put subchunk");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default()
+            .with_block_color("minecraft:dirt", RgbaColor::new(130, 90, 55, 255))
+            .with_block_color("minecraft:grass", RgbaColor::new(20, 200, 20, 255));
+        let expected = palette
+            .surface_block_color("minecraft:grass", None, false)
+            .to_array();
+        let renderer = MapRenderer::new(world, palette);
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 1,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        biome_tint: false,
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render bedrock grass");
+
+        assert_eq!(&tile.rgba[0..4], &expected);
+        assert!(tile.rgba[1] > tile.rgba[0], "grass should stay green");
+    }
+
+    #[test]
+    fn surface_blocks_show_common_thin_overlays() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 4),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes_with_values(
+                    [
+                        ("minecraft:air", 0_u16),
+                        ("minecraft:grass_block", 1),
+                        ("minecraft:short_grass", 2),
+                        ("minecraft:poppy", 3),
+                        ("minecraft:rail", 4),
+                        ("minecraft:oak_pressure_plate", 5),
+                    ],
+                    |local_x, _, local_y| match local_y {
+                        0 => 1,
+                        1 => match local_x {
+                            0 => 2,
+                            1 => 3,
+                            2 => 4,
+                            _ => 5,
+                        },
+                        _ => 0,
+                    },
+                ),
+            )
+            .expect("put subchunk");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default()
+            .with_block_color("minecraft:grass_block", RgbaColor::new(20, 180, 20, 255))
+            .with_block_color("minecraft:short_grass", RgbaColor::new(40, 240, 40, 255))
+            .with_block_color("minecraft:poppy", RgbaColor::new(230, 40, 30, 255))
+            .with_block_color("minecraft:rail", RgbaColor::new(150, 130, 80, 255))
+            .with_block_color(
+                "minecraft:oak_pressure_plate",
+                RgbaColor::new(160, 110, 55, 255),
+            );
+        let support = palette.surface_block_color("minecraft:grass_block", None, false);
+        let expected = [
+            ("minecraft:short_grass", 0_u32),
+            ("minecraft:poppy", 1),
+            ("minecraft:rail", 2),
+            ("minecraft:oak_pressure_plate", 3),
+        ]
+        .map(|(name, x)| {
+            let overlay = palette.surface_block_color(name, None, false);
+            let color = alpha_blend_surface(
+                overlay,
+                support,
+                surface_overlay_alpha(name).expect("overlay alpha"),
+            )
+            .to_array();
+            (x, color)
+        });
+        let renderer = MapRenderer::new(world, palette);
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 4,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        biome_tint: false,
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render thin overlays");
+
+        for (x, color) in expected {
+            let actual = pixel_rgba(&tile.rgba, tile.width, x, 0);
+            assert_eq!(actual, color);
+            assert_ne!(actual, support.to_array());
+        }
+    }
+
+    #[test]
+    fn surface_blocks_keep_carpet_building_details() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 4),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes_with_values(
+                    [
+                        ("minecraft:air", 0_u16),
+                        ("minecraft:stone", 1),
+                        ("minecraft:white_concrete", 2),
+                        ("minecraft:gray_carpet", 3),
+                    ],
+                    |_, _, local_y| match local_y {
+                        0 => 1,
+                        1 => 2,
+                        2 => 3,
+                        _ => 0,
+                    },
+                ),
+            )
+            .expect("put subchunk");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default()
+            .with_block_color(
+                "minecraft:white_concrete",
+                RgbaColor::new(220, 220, 220, 255),
+            )
+            .with_block_color("minecraft:gray_carpet", RgbaColor::new(80, 80, 80, 255));
+        let expected = palette.block_color("minecraft:gray_carpet").to_array();
+        let renderer = MapRenderer::new(world, palette);
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 1,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        biome_tint: false,
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render carpet detail");
+
+        assert_eq!(&tile.rgba[0..4], &expected);
+    }
+
+    #[test]
+    fn surface_blocks_per_pixel_averages_covered_blocks() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 4),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes_with_top_values(
+                    [
+                        ("minecraft:air", 0_u16),
+                        ("minecraft:stone", 1),
+                        ("minecraft:green_test", 2),
+                    ],
+                    |local_x, local_z| {
+                        if local_x == 0 && local_z == 0 { 1 } else { 2 }
+                    },
+                ),
+            )
+            .expect("put subchunk");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default()
+            .with_block_color("minecraft:stone", RgbaColor::new(10, 10, 10, 255))
+            .with_block_color("minecraft:green_test", RgbaColor::new(20, 200, 20, 255));
+        let renderer = MapRenderer::new(world, palette);
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 1,
+                    scale: 16,
+                    pixels_per_block: 1,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        biome_tint: false,
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render downsampled surface");
+
+        assert!(tile.rgba[1] > 180, "covered grass should dominate");
+        assert_ne!(&tile.rgba[0..4], &[10, 10, 10, 255]);
+    }
+
+    #[test]
+    fn region_surface_blocks_per_pixel_preserves_partial_cross() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 4),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes_with_top_values(
+                    [
+                        ("minecraft:air", 0_u16),
+                        ("minecraft:light_platform", 1),
+                        ("minecraft:dark_platform", 2),
+                    ],
+                    |local_x, local_z| {
+                        if (6..=9).contains(&local_x) || (6..=9).contains(&local_z) {
+                            2
+                        } else {
+                            1
+                        }
+                    },
+                ),
+            )
+            .expect("put subchunk");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default()
+            .with_block_color(
+                "minecraft:light_platform",
+                RgbaColor::new(200, 200, 200, 255),
+            )
+            .with_block_color("minecraft:dark_platform", RgbaColor::new(80, 80, 80, 255));
+        let renderer = MapRenderer::new(world, palette);
+        let tiles = renderer
+            .render_region_tiles_blocking(
+                ChunkRegion::new(Dimension::Overworld, 0, 0, 0, 0),
+                RenderMode::SurfaceBlocks,
+                ChunkTileLayout {
+                    chunks_per_tile: 1,
+                    blocks_per_pixel: 4,
+                    pixels_per_block: 1,
+                },
+                RenderOptions {
+                    format: ImageFormat::Rgba,
+                    backend: RenderBackend::Cpu,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        biome_tint: false,
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render region surface tiles");
+        let tile = tiles.tiles.first().expect("one tile should render");
+
+        let corner = pixel_rgba(&tile.rgba, tile.width, 0, 0);
+        let partial_arm = pixel_rgba(&tile.rgba, tile.width, 1, 0);
+        let center = pixel_rgba(&tile.rgba, tile.width, 1, 1);
+        assert_eq!(corner, [200, 200, 200, 255]);
+        assert!(
+            (110..=170).contains(&partial_arm[0]),
+            "partial cross arm should be averaged, got {partial_arm:?}"
+        );
+        assert!(
+            center[0] < partial_arm[0],
+            "cross center should stay darker than an edge arm"
+        );
     }
 
     #[test]
@@ -5425,6 +8619,9 @@ mod tests {
         let palette = RenderPalette::default()
             .with_block_color("minecraft:stone", RgbaColor::new(10, 10, 10, 255))
             .with_block_color("minecraft:grass_block", RgbaColor::new(20, 200, 20, 255));
+        let expected = palette
+            .surface_block_color("minecraft:grass_block", None, false)
+            .to_array();
         let renderer = MapRenderer::new(world, palette);
         let tile = renderer
             .render_tile_with_options_blocking(
@@ -5444,6 +8641,7 @@ mod tests {
                     threading: RenderThreadingOptions::Single,
                     surface: SurfaceRenderOptions {
                         biome_tint: false,
+                        height_shading: false,
                         ..SurfaceRenderOptions::default()
                     },
                     ..RenderOptions::default()
@@ -5451,7 +8649,80 @@ mod tests {
             )
             .expect("render surface");
 
-        assert_eq!(&tile.rgba[0..4], &[20, 200, 20, 255]);
+        assert_eq!(&tile.rgba[0..4], &expected);
+    }
+
+    #[test]
+    fn surface_blocks_applies_distinct_biome_tint_to_grass() {
+        let storage = Arc::new(MemoryStorage::new());
+        for (chunk_x, biome) in [(0, 2), (1, 21)] {
+            let pos = ChunkPos {
+                x: chunk_x,
+                z: 0,
+                dimension: Dimension::Overworld,
+            };
+            storage
+                .put(
+                    &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                    &test_data2d_bytes(65, biome),
+                )
+                .expect("put data2d");
+            storage
+                .put(
+                    &ChunkKey::subchunk(pos, 4).encode(),
+                    &test_surface_subchunk_bytes([
+                        ("minecraft:air", 0_u16),
+                        ("minecraft:stone", 1),
+                        ("minecraft:grass_block", 2),
+                    ]),
+                )
+                .expect("put subchunk");
+        }
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default();
+        let expected_desert = palette
+            .surface_block_color("minecraft:grass_block", Some(2), true)
+            .to_array();
+        let expected_jungle = palette
+            .surface_block_color("minecraft:grass_block", Some(21), true)
+            .to_array();
+        let renderer = MapRenderer::new(world, palette);
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 32,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render surface biome tint");
+
+        let desert = pixel_rgba(&tile.rgba, tile.width, 0, 0);
+        let jungle = pixel_rgba(&tile.rgba, tile.width, 16, 0);
+        assert_eq!(desert, expected_desert);
+        assert_eq!(jungle, expected_jungle);
+        assert!(desert[0] > desert[1] && desert[1] > desert[2]);
+        assert!(jungle[1] > jungle[0] && jungle[1] > jungle[2]);
+        assert!(rgba_distance(desert, jungle) >= 80);
     }
 
     #[test]
@@ -5486,6 +8757,9 @@ mod tests {
         let palette = RenderPalette::default()
             .with_block_color("minecraft:stone", RgbaColor::new(10, 10, 10, 255))
             .with_block_color("minecraft:oak_leaves", RgbaColor::new(20, 120, 20, 255));
+        let expected = palette
+            .surface_block_color("minecraft:oak_leaves", None, false)
+            .to_array();
         let renderer = MapRenderer::new(world, palette);
         let tile = renderer
             .render_tile_with_options_blocking(
@@ -5513,7 +8787,7 @@ mod tests {
             )
             .expect("render surface");
 
-        assert_eq!(&tile.rgba[0..4], &[20, 120, 20, 255]);
+        assert_eq!(&tile.rgba[0..4], &expected);
     }
 
     #[test]
@@ -5570,6 +8844,177 @@ mod tests {
         assert_eq!(tile.rgba[3], 255);
         assert_ne!(&tile.rgba[0..3], &[43, 92, 210]);
         assert_ne!(&tile.rgba[0..3], &[218, 210, 158]);
+    }
+
+    #[test]
+    fn surface_blocks_use_banner_block_entity_base_color() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 1),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes([
+                    ("minecraft:air", 0_u16),
+                    ("minecraft:stone", 1),
+                    ("minecraft:standing_banner", 2),
+                ]),
+            )
+            .expect("put subchunk");
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::BlockEntity).encode(),
+                &test_block_entity_bytes(NbtTag::Compound(IndexMap::from([
+                    ("id".to_string(), NbtTag::String("Banner".to_string())),
+                    ("x".to_string(), NbtTag::Int(0)),
+                    ("y".to_string(), NbtTag::Int(65)),
+                    ("z".to_string(), NbtTag::Int(0)),
+                    ("Base".to_string(), NbtTag::Int(14)),
+                ]))),
+            )
+            .expect("put banner block entity");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let mut palette = RenderPalette::default();
+        palette
+            .merge_json_str(
+                r#"{
+                    "blocks": {
+                        "minecraft:standing_banner": {
+                            "default": [255, 255, 255, 255],
+                            "variant_colors": {
+                                "banner_base_red": [200, 20, 10, 255],
+                                "banner_base_white": [255, 255, 255, 255]
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .expect("merge banner variants");
+        let renderer = MapRenderer::new(world, palette);
+
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 1,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render banner surface");
+
+        assert_eq!(&tile.rgba[0..4], &[200, 20, 10, 255]);
+    }
+
+    #[test]
+    fn surface_blocks_use_moving_block_entity_state() {
+        let pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::Data2D).encode(),
+                &test_data2d_bytes(65, 1),
+            )
+            .expect("put data2d");
+        storage
+            .put(
+                &ChunkKey::subchunk(pos, 4).encode(),
+                &test_surface_subchunk_bytes([
+                    ("minecraft:air", 0_u16),
+                    ("minecraft:stone", 1),
+                    ("minecraft:movingBlock", 2),
+                ]),
+            )
+            .expect("put subchunk");
+        storage
+            .put(
+                &ChunkKey::new(pos, ChunkRecordTag::BlockEntity).encode(),
+                &test_block_entity_bytes(NbtTag::Compound(IndexMap::from([
+                    ("id".to_string(), NbtTag::String("MovingBlock".to_string())),
+                    ("x".to_string(), NbtTag::Int(0)),
+                    ("y".to_string(), NbtTag::Int(65)),
+                    ("z".to_string(), NbtTag::Int(0)),
+                    (
+                        "movingBlock".to_string(),
+                        NbtTag::Compound(IndexMap::from([
+                            (
+                                "name".to_string(),
+                                NbtTag::String("minecraft:gold_block".to_string()),
+                            ),
+                            ("states".to_string(), NbtTag::Compound(IndexMap::new())),
+                            ("version".to_string(), NbtTag::Int(1)),
+                        ])),
+                    ),
+                ]))),
+            )
+            .expect("put moving block entity");
+        let world = Arc::new(BedrockWorld::from_storage(
+            "memory",
+            storage,
+            OpenOptions::default(),
+        ));
+        let palette = RenderPalette::default()
+            .with_block_color("minecraft:movingBlock", RgbaColor::new(1, 1, 1, 255))
+            .with_block_color("minecraft:gold_block", RgbaColor::new(240, 200, 30, 255));
+        let renderer = MapRenderer::new(world, palette);
+
+        let tile = renderer
+            .render_tile_with_options_blocking(
+                RenderJob {
+                    tile_size: 1,
+                    ..RenderJob::new(
+                        TileCoord {
+                            x: 0,
+                            z: 0,
+                            dimension: Dimension::Overworld,
+                        },
+                        RenderMode::SurfaceBlocks,
+                    )
+                },
+                &RenderOptions {
+                    format: ImageFormat::Rgba,
+                    threading: RenderThreadingOptions::Single,
+                    surface: SurfaceRenderOptions {
+                        height_shading: false,
+                        ..SurfaceRenderOptions::default()
+                    },
+                    ..RenderOptions::default()
+                },
+            )
+            .expect("render moving block surface");
+
+        assert_eq!(&tile.rgba[0..4], &[240, 200, 30, 255]);
     }
 
     #[test]
@@ -5809,10 +9254,31 @@ mod tests {
     }
 
     fn test_surface_subchunk_bytes<const N: usize>(palette_entries: [(&str, u16); N]) -> Vec<u8> {
-        let bits_per_value = if palette_entries.len() <= 2 {
-            1_u8
-        } else {
-            2_u8
+        test_surface_subchunk_bytes_with_top_values(palette_entries, |_, _| 2)
+    }
+
+    fn test_surface_subchunk_bytes_with_top_values<const N: usize>(
+        palette_entries: [(&str, u16); N],
+        top_value: impl Fn(u8, u8) -> u16,
+    ) -> Vec<u8> {
+        test_surface_subchunk_bytes_with_values(palette_entries, |local_x, local_z, local_y| {
+            match local_y {
+                0 => 1,
+                1 => top_value(local_x, local_z),
+                _ => 0,
+            }
+        })
+    }
+
+    fn test_surface_subchunk_bytes_with_values<const N: usize>(
+        palette_entries: [(&str, u16); N],
+        value_at: impl Fn(u8, u8, u8) -> u16,
+    ) -> Vec<u8> {
+        let bits_per_value = match palette_entries.len() {
+            0..=2 => 1_u8,
+            3..=4 => 2_u8,
+            5..=16 => 4_u8,
+            _ => 8_u8,
         };
         let values_per_word = usize::from(32 / bits_per_value);
         let word_count = 4096_usize.div_ceil(values_per_word);
@@ -5820,7 +9286,11 @@ mod tests {
         let mut words = vec![0_u32; word_count];
         for local_z in 0..16_u8 {
             for local_x in 0..16_u8 {
-                for (local_y, value) in [(0_u8, 1_u16), (1, 2)] {
+                for local_y in 0..16_u8 {
+                    let value = value_at(local_x, local_z, local_y);
+                    if value == 0 {
+                        continue;
+                    }
                     let block_index = block_storage_index(local_x, local_y, local_z);
                     let word_index = block_index / values_per_word;
                     let bit_offset = (block_index % values_per_word) * usize::from(bits_per_value);
@@ -5854,6 +9324,10 @@ mod tests {
         bytes
     }
 
+    fn test_block_entity_bytes(tag: NbtTag) -> Vec<u8> {
+        bedrock_world::nbt::serialize_root_nbt(&tag).expect("block entity nbt")
+    }
+
     fn test_data3d_single_biome_bytes(biome: i32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(517);
         for _ in 0..256 {
@@ -5862,5 +9336,40 @@ mod tests {
         bytes.push(0);
         bytes.extend_from_slice(&biome.to_le_bytes());
         bytes
+    }
+
+    fn pixel_rgba(rgba: &[u8], width: u32, x: u32, z: u32) -> [u8; 4] {
+        let index = usize::try_from((z * width + x) * 4).expect("pixel index fits usize");
+        [
+            rgba[index],
+            rgba[index + 1],
+            rgba[index + 2],
+            rgba[index + 3],
+        ]
+    }
+
+    fn rgba_distance(left: [u8; 4], right: [u8; 4]) -> u16 {
+        u16::from(left[0].abs_diff(right[0]))
+            + u16::from(left[1].abs_diff(right[1]))
+            + u16::from(left[2].abs_diff(right[2]))
+    }
+
+    fn rgba_color_distance(left: RgbaColor, right: RgbaColor) -> u16 {
+        u16::from(left.red.abs_diff(right.red))
+            + u16::from(left.green.abs_diff(right.green))
+            + u16::from(left.blue.abs_diff(right.blue))
+    }
+
+    fn test_block_state<'a>(
+        name: &str,
+        states: impl Iterator<Item = (&'a str, NbtTag)>,
+    ) -> BlockState {
+        BlockState {
+            name: name.to_string(),
+            states: states
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            version: Some(1),
+        }
     }
 }

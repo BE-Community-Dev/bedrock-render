@@ -29,6 +29,9 @@ formats they need.
 - Web-map export uses a global chunk-bake queue, per-wave dynamic memory budget,
   parallel tile compose/encode, and a bounded MPMC writer queue so CPU workers
   are not serialized behind `fs::write`.
+- Interactive frontends should create one `MapRenderSession` per opened world.
+  A session holds the renderer, tile cache, and diagnostics context so panning
+  and zooming do not reopen the world or rebuild cache state for every batch.
 - `RenderMemoryBudget::Auto` uses a bounded cache budget for chunk bakes and
   export waves. `FixedBytes` and `Disabled` are available for offline tooling.
 - Long operations support explicit cancellation and progress callbacks.
@@ -84,6 +87,113 @@ let tiles = renderer.render_region_tiles_blocking(
         ..RenderOptions::default()
     },
 )?;
+```
+
+## Streaming Session API
+
+`MapRenderSession` is the high-performance path for GPUI and other interactive
+map viewers. It streams tile events as work completes, reuses the world handle
+and tile cache, supports cancellation, and can cull missing chunks with the new
+`bedrock-world` render-index APIs before baking.
+
+```rust
+use std::sync::Arc;
+use bedrock_render::{
+    ChunkRegion, ImageFormat, MapRenderSession, MapRenderSessionConfig,
+    MapRenderer, RenderCachePolicy, RenderCancelFlag, RenderExecutionProfile,
+    RenderLayout, RenderMode, RenderOptions, RenderPalette, RenderTilePriority,
+    TileStreamEvent,
+};
+
+let renderer = MapRenderer::new(Arc::new(world), RenderPalette::default());
+let session = MapRenderSession::new(
+    renderer,
+    MapRenderSessionConfig {
+        cache_root: "target/bedrock-render-cache".into(),
+        world_id: "viewer".into(),
+        world_signature: "leveldb-manifest-and-leveldat-signature".into(),
+        cull_missing_chunks: true,
+        ..MapRenderSessionConfig::default()
+    },
+);
+
+let layout = RenderLayout::default();
+let region = ChunkRegion::new(dimension, -32, -32, 31, 31);
+let planned_tiles = MapRenderer::plan_region_tiles(region, RenderMode::SurfaceBlocks, layout)?;
+let cancel = RenderCancelFlag::new();
+
+session.render_web_tiles_streaming_blocking(
+    &planned_tiles,
+    RenderOptions {
+        format: ImageFormat::WebP,
+        execution_profile: RenderExecutionProfile::Interactive,
+        cache_policy: RenderCachePolicy::Use,
+        cancel: Some(cancel.clone()),
+        priority: RenderTilePriority::DistanceFrom { tile_x: 0, tile_z: 0 },
+        ..RenderOptions::default()
+    },
+    |event| {
+        match event {
+            TileStreamEvent::Cached { planned, encoded } => {
+                // Decode or hand encoded bytes to the UI image cache.
+            }
+            TileStreamEvent::Rendered { planned, tile } => {
+                // Present tile.rgba immediately and keep tile.encoded for cache.
+            }
+            TileStreamEvent::Failed { planned, error } => {
+                eprintln!("tile failed: {error}");
+            }
+            TileStreamEvent::Progress(progress) => {
+                eprintln!("tiles {}/{}", progress.completed_tiles, progress.total_tiles);
+            }
+            TileStreamEvent::Complete { diagnostics, stats } => {
+                eprintln!("cache hits={} gpu={:?}", stats.cache_hits, stats.resolved_backend);
+            }
+        }
+        Ok(())
+    },
+)?;
+```
+
+### Migration: blocking batch to cancellable streaming
+
+Legacy callers that used `render_web_tiles_blocking` usually waited for an
+entire batch before updating UI:
+
+```rust
+renderer.render_web_tiles_blocking(&planned_tiles, options, |planned, tile| {
+    write_tile(planned, tile)?;
+    Ok(())
+})?;
+```
+
+Prefer a long-lived session and stream tile events into the frontend:
+
+```rust
+let session = MapRenderSession::new(renderer, MapRenderSessionConfig::default());
+let cancel = RenderCancelFlag::new();
+session.render_web_tiles_streaming_blocking(
+    &planned_tiles,
+    RenderOptions {
+        cancel: Some(cancel),
+        cache_policy: RenderCachePolicy::Use,
+        ..options
+    },
+    |event| {
+        enqueue_tile_event(event)?;
+        Ok(())
+    },
+)?;
+```
+
+The old batch APIs remain available for export tools, but new interactive code
+should treat the session streaming API as the primary entry point.
+
+The `render_streaming_session` example demonstrates the same event flow against
+a local world:
+
+```text
+cargo run --example render_streaming_session -- <world_path>
 ```
 
 ## Preview Tool
@@ -181,48 +291,42 @@ mapping.
 ## External Palettes
 
 The default palette is embedded in the crate and in compiled binaries. It ships
-with two auditable JSON sources plus a prebuilt `BRPAL01` binary cache:
+with two auditable JSON sources:
 
 ```text
 data/colors/bedrock-block-color.json
 data/colors/bedrock-biome-color.json
-data/colors/bedrock-colors.brpal
 ```
 
-`RenderPalette::default()` loads the embedded binary cache first, so normal
-rendering does not parse JSON or require external palette files. The JSON files
-remain available through `RenderPalette::builtin_block_color_json()` and
-`RenderPalette::builtin_biome_color_json()` for auditing and rebuild tooling.
-`RenderPalette::from_builtin_json_sources()` rebuilds the same palette from the
-auditable JSON sources without reading the binary cache.
+`RenderPalette::default()` builds from the embedded JSON sources, so normal
+rendering does not require external palette files. The JSON files remain
+available through `RenderPalette::builtin_block_color_json()` and
+`RenderPalette::builtin_biome_color_json()` for auditing and tooling.
 The built-in data is maintained inside this project for Bedrock rendering; the
-loader also understands the public bedrock-level color JSON shape so projects
-can regenerate or compare palettes when their licensing policy allows it.
+loader also understands legacy object-map palette JSON so applications can
+import their own licensed color data without depending on another renderer.
 
 For projects that have their own licensed color data, `RenderPalette` also
-supports additional user-provided JSON and a compact binary cache format:
+supports additional user-provided JSON:
 
 ```text
 --palette-json target/bedrock-block-color.json
 --palette-json target/bedrock-biome-color.json
---palette-cache target/colors.brpal
---rebuild-palette-cache
 ```
 
-JSON is an import/override format. The embedded `BRPAL01` binary cache is the
-recommended hot path for applications because it is a sequential,
-allocation-light table of biome ids and block-name RGBA entries. The JSON loader
-accepts combined objects
+JSON is an import/override format. Tintable blocks use mask colors in the block
+source and receive their final render color from biome tint data. The JSON
+loader accepts combined objects
 with `schema_version` / `sources` / `blocks` / `defaults` / `biomes`, object maps such as
 `{"minecraft:stone":"#7d7d7d"}`, arrays with `name` / `id` plus `color`, and
-the bedrock-level color JSON shapes for local user-provided reference data.
+legacy multi-texture object-map shapes for local user-provided reference data.
 
 Palette source maintenance commands:
 
 ```text
 cargo run --example palette_tool -- audit --check
+cargo run --example palette_tool -- generate-clean-room --check
 cargo run --example palette_tool -- normalize --check
-cargo run --example palette_tool -- rebuild-cache --check
 ```
 
 Source policy and public references are documented in
@@ -239,13 +343,10 @@ cargo run --example render_web_map -- \
   --y 64 \
   --palette-json target/bedrock-block-color.json \
   --palette-json target/bedrock-biome-color.json \
-  --palette-cache target/bedrock-colors.brpal \
-  --rebuild-palette-cache \
   --force
 
-loaded palette JSON target\bedrock-block-color.json: block_colors=1207 biome_colors=0 skipped=0
+loaded palette JSON target\bedrock-block-color.json: block_colors=1211 biome_colors=0 skipped=0
 loaded palette JSON target\bedrock-biome-color.json: block_colors=0 biome_colors=88 skipped=0
-wrote palette cache: target\bedrock-colors.brpal
 overworld surface tiles=1 missing=0 transparent=0 unknown=0
 overworld layer-y64 tiles=1 missing=0 transparent=12544 unknown=0
 ```
@@ -254,9 +355,8 @@ Latest local debug preview run:
 
 ```text
 cargo run --example render_preview --features png
-Generated 6 atlas images and 54 web-map PNG tiles.
-Viewport: 3x3 tiles, 16 chunks per tile, 256x256 px per tile.
 surface diagnostics: missing_chunks=0 missing_heightmaps=0 unknown_blocks=0 fallback_pixels=0
+preview output: target/bedrock-render-preview
 ```
 
 Latest local WebP web-map smoke run:
@@ -279,9 +379,9 @@ LayerBlocks transparent pixels are expected for unloaded fixed-Y areas.
 
 ## Rendered Examples
 
-These images are generated by the preview tool from the bundled sample fixture
-and the current default palette. The terrain view follows the BedrockMap-style
-top-down bake flow while remaining part of this standalone public renderer.
+These images are generated by the preview tool with the current default
+palette. The terrain view references BedrockMap-style top-down map behavior
+while remaining part of this standalone public renderer.
 
 ### `Biome { y }`
 
@@ -306,7 +406,10 @@ Fixed world-Y block layer rendered as an X/Z plane. This is not a side section.
 Primary top-down terrain map. Each X/Z column uses the chunk height map, scans
 down to the highest renderable block, applies biome tint, and blends transparent
 water with the block below. Lightweight height-normal shading is enabled by default
-so terrain does not look completely flat; use `HeightMap` for elevation analysis.
+so terrain does not look completely flat. `SurfaceRenderOptions::block_boundaries`
+adds a subtle 2D per-block outline and height-contact shadow so cliffs, paths,
+and same-color blocks remain readable without switching to a 2.5D view. Use
+`HeightMap` for elevation analysis.
 
 ![Surface block map](docs/images/surface-viewport.png)
 
@@ -351,6 +454,16 @@ Fixed Y cave diagnostic map for air, solid blocks, water, and lava.
   stale cached tiles are rejected by the UI and regenerated.
 - `ImageFormat::Rgba` is the lowest-latency UI path. WebP/PNG are intended for
   cache/export/preview paths.
+- `RenderOptions::gpu` controls GPU compose scheduling. `max_in_flight=0`,
+  `batch_size=0`, `batch_pixels=0`, `submit_workers=0`, `readback_workers=0`,
+  `buffer_pool_bytes=0`, and `staging_pool_bytes=0` use profile-aware defaults;
+  export workloads allow more in-flight GPU work than interactive workloads.
+- `RenderOptions::cpu` controls bounded CPU queue depth and chunk batch sizing,
+  while `RenderOptions::priority` lets interactive sessions render the current
+  viewport center before distant tiles.
+- GPU compose runs with bounded concurrent in-flight jobs on one `wgpu` device.
+  Failed GPU tiles fall back to CPU and report `gpu_fallback_reason`; stats also
+  expose GPU batch tiles, submit/readback workers, and buffer/staging pool reuse.
 - The static web-map example writes WebP tiles under
   `tiles/<dimension>/<mode>/<layout>/<tile_z>/<tile_x>.webp`; it does not leave
   gaps between tiles and uses transparent pixels for absent world data.
@@ -385,7 +498,6 @@ and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 ## Current Limits
 
 - Surface rendering is top-down and BedrockMap-style. Web-map export now uses a
-  global chunk-bake queue, but cross-process persistent chunk-bake reuse is still
-  a future optimization.
-- V1 does not implement lighting, shadows, elevation blending, entity markers,
-  or labels.
+  global chunk-bake queue and bounded GPU compose queue, but cross-process
+  persistent chunk-bake reuse is still a future optimization.
+- V1 does not implement entity markers or labels.

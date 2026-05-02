@@ -1,9 +1,10 @@
 use bedrock_render::{
-    ChunkRegion, DEFAULT_PALETTE_VERSION, GPU_COMPOSE_SHADER_VERSION, ImageFormat, MapRenderer,
-    PlannedTile, RENDERER_CACHE_VERSION, RegionLayout, RenderBackend, RenderDiagnostics,
-    RenderDiagnosticsSink, RenderExecutionProfile, RenderJob, RenderLayout, RenderMemoryBudget,
-    RenderMode, RenderOptions, RenderPalette, RenderPipelineStats, RenderThreadingOptions,
-    SurfaceRenderOptions, TerrainLightingOptions, TerrainLightingPreset, TileCoord,
+    BlockBoundaryRenderOptions, ChunkRegion, DEFAULT_PALETTE_VERSION, GPU_COMPOSE_SHADER_VERSION,
+    ImageFormat, MapRenderer, PlannedTile, RENDERER_CACHE_VERSION, RegionLayout, RenderBackend,
+    RenderDiagnostics, RenderDiagnosticsSink, RenderExecutionProfile, RenderGpuOptions, RenderJob,
+    RenderLayout, RenderMemoryBudget, RenderMode, RenderOptions, RenderPalette,
+    RenderPipelineStats, RenderThreadingOptions, SurfaceRenderOptions, TerrainLightingOptions,
+    TerrainLightingPreset, TileCoord,
 };
 use bedrock_world::{
     BedrockLevelDbStorage, BedrockWorld, ChunkBounds, ChunkPos, Dimension, OpenOptions,
@@ -58,20 +59,6 @@ fn main() -> bedrock_render::Result<()> {
             report.skipped_entries
         );
     }
-    if let Some(cache_path) = &config.palette_cache_path {
-        if cache_path.exists() && !config.rebuild_palette_cache {
-            let report = palette.merge_binary_file(cache_path)?;
-            println!(
-                "loaded palette cache {}: block_colors={} biome_colors={}",
-                cache_path.display(),
-                report.block_colors,
-                report.biome_colors
-            );
-        } else {
-            palette.write_binary_file(cache_path)?;
-            println!("wrote palette cache: {}", cache_path.display());
-        }
-    }
     config.cache_signature = cache_signature(
         &config.world_path,
         config.layout,
@@ -79,7 +66,7 @@ fn main() -> bedrock_render::Result<()> {
         config.surface_options,
         config.backend,
         &config.palette_json_paths,
-        config.palette_cache_path.as_ref(),
+        None,
     )?;
     let cache_valid =
         read_cache_manifest(&config)?.is_some_and(|manifest| manifest == config.cache_signature);
@@ -148,6 +135,7 @@ struct WebMapConfig {
     layout: RenderLayout,
     region_layout: RegionLayout,
     surface_options: SurfaceRenderOptions,
+    gpu_options: RenderGpuOptions,
     region: Option<(i32, i32, i32, i32)>,
     threading: RenderThreadingOptions,
     backend: RenderBackend,
@@ -156,8 +144,6 @@ struct WebMapConfig {
     pipeline_depth: usize,
     print_stats: bool,
     palette_json_paths: Vec<PathBuf>,
-    palette_cache_path: Option<PathBuf>,
-    rebuild_palette_cache: bool,
     plugin_data_paths: Vec<PathBuf>,
     viewer_prefetch_radius: usize,
     viewer_retain_radius: usize,
@@ -194,6 +180,8 @@ impl WebMapConfig {
         let mut pixels_per_block = None;
         let mut tile_size_pixels = None;
         let mut terrain_lighting = TerrainLightingOptions::default();
+        let mut block_boundaries = BlockBoundaryRenderOptions::default();
+        let mut gpu_options = RenderGpuOptions::default();
         let mut region = None;
         let mut threading = RenderThreadingOptions::Auto;
         let mut backend = RenderBackend::Auto;
@@ -202,8 +190,6 @@ impl WebMapConfig {
         let mut pipeline_depth = 0_usize;
         let mut print_stats = false;
         let mut palette_json_paths = Vec::new();
-        let mut palette_cache_path = None;
-        let mut rebuild_palette_cache = false;
         let mut plugin_data_paths = Vec::new();
         let mut viewer_prefetch_radius = 1_usize;
         let mut viewer_retain_radius = 2_usize;
@@ -379,6 +365,40 @@ impl WebMapConfig {
                         "--underwater-min-light",
                     )?;
                 }
+                "--block-boundaries" => {
+                    block_boundaries.enabled =
+                        parse_bool(&next_arg(&args, &mut index, "--block-boundaries")?)?;
+                }
+                "--block-boundary-strength" => {
+                    block_boundaries.strength = parse_f32(
+                        &next_arg(&args, &mut index, "--block-boundary-strength")?,
+                        "--block-boundary-strength",
+                    )?;
+                }
+                "--block-boundary-flat-strength" => {
+                    block_boundaries.flat_strength = parse_f32(
+                        &next_arg(&args, &mut index, "--block-boundary-flat-strength")?,
+                        "--block-boundary-flat-strength",
+                    )?;
+                }
+                "--block-boundary-threshold" => {
+                    block_boundaries.height_threshold = parse_f32(
+                        &next_arg(&args, &mut index, "--block-boundary-threshold")?,
+                        "--block-boundary-threshold",
+                    )?;
+                }
+                "--block-boundary-max-shadow" => {
+                    block_boundaries.max_shadow = parse_f32(
+                        &next_arg(&args, &mut index, "--block-boundary-max-shadow")?,
+                        "--block-boundary-max-shadow",
+                    )?;
+                }
+                "--block-boundary-line-width" => {
+                    block_boundaries.line_width_pixels = parse_f32(
+                        &next_arg(&args, &mut index, "--block-boundary-line-width")?,
+                        "--block-boundary-line-width",
+                    )?;
+                }
                 "--region" => {
                     region = Some(parse_region(&next_arg(&args, &mut index, "--region")?)?);
                 }
@@ -387,6 +407,54 @@ impl WebMapConfig {
                 }
                 "--gpu" => {
                     backend = parse_backend(&next_arg(&args, &mut index, "--gpu")?)?;
+                }
+                "--gpu-min-pixels" => {
+                    gpu_options.min_pixels = parse_positive_usize(
+                        &next_arg(&args, &mut index, "--gpu-min-pixels")?,
+                        "--gpu-min-pixels",
+                    )?;
+                }
+                "--gpu-max-in-flight" => {
+                    gpu_options.max_in_flight = parse_nonnegative_usize(
+                        &next_arg(&args, &mut index, "--gpu-max-in-flight")?,
+                        "--gpu-max-in-flight",
+                    )?;
+                }
+                "--gpu-batch-size" => {
+                    gpu_options.batch_size = parse_nonnegative_usize(
+                        &next_arg(&args, &mut index, "--gpu-batch-size")?,
+                        "--gpu-batch-size",
+                    )?;
+                }
+                "--gpu-batch-pixels" => {
+                    gpu_options.batch_pixels = parse_nonnegative_usize(
+                        &next_arg(&args, &mut index, "--gpu-batch-pixels")?,
+                        "--gpu-batch-pixels",
+                    )?;
+                }
+                "--gpu-submit-workers" => {
+                    gpu_options.submit_workers = parse_nonnegative_usize(
+                        &next_arg(&args, &mut index, "--gpu-submit-workers")?,
+                        "--gpu-submit-workers",
+                    )?;
+                }
+                "--gpu-readback-workers" => {
+                    gpu_options.readback_workers = parse_nonnegative_usize(
+                        &next_arg(&args, &mut index, "--gpu-readback-workers")?,
+                        "--gpu-readback-workers",
+                    )?;
+                }
+                "--gpu-buffer-pool-bytes" => {
+                    gpu_options.buffer_pool_bytes = parse_nonnegative_usize(
+                        &next_arg(&args, &mut index, "--gpu-buffer-pool-bytes")?,
+                        "--gpu-buffer-pool-bytes",
+                    )?;
+                }
+                "--gpu-staging-pool-bytes" => {
+                    gpu_options.staging_pool_bytes = parse_nonnegative_usize(
+                        &next_arg(&args, &mut index, "--gpu-staging-pool-bytes")?,
+                        "--gpu-staging-pool-bytes",
+                    )?;
                 }
                 "--profile" => {
                     profile = parse_profile(&next_arg(&args, &mut index, "--profile")?)?;
@@ -410,16 +478,6 @@ impl WebMapConfig {
                         &mut index,
                         "--palette-json",
                     )?));
-                }
-                "--palette-cache" => {
-                    palette_cache_path = Some(PathBuf::from(next_arg(
-                        &args,
-                        &mut index,
-                        "--palette-cache",
-                    )?));
-                }
-                "--rebuild-palette-cache" => {
-                    rebuild_palette_cache = true;
                 }
                 "--plugin-data" => {
                     plugin_data_paths.push(PathBuf::from(next_arg(
@@ -560,6 +618,7 @@ impl WebMapConfig {
         let surface_options = SurfaceRenderOptions {
             height_shading: terrain_lighting.enabled,
             lighting: terrain_lighting,
+            block_boundaries,
             ..SurfaceRenderOptions::default()
         };
         let cache_signature = cache_signature(
@@ -569,7 +628,7 @@ impl WebMapConfig {
             surface_options,
             backend,
             &palette_json_paths,
-            palette_cache_path.as_ref(),
+            None,
         )?;
         Ok(Self {
             world_path,
@@ -581,6 +640,7 @@ impl WebMapConfig {
             layout,
             region_layout,
             surface_options,
+            gpu_options,
             region,
             threading,
             backend,
@@ -589,8 +649,6 @@ impl WebMapConfig {
             pipeline_depth,
             print_stats,
             palette_json_paths,
-            palette_cache_path,
-            rebuild_palette_cache,
             plugin_data_paths,
             viewer_prefetch_radius,
             viewer_retain_radius,
@@ -1008,6 +1066,7 @@ fn render_dimension_mode(
             RenderOptions {
                 format: ImageFormat::WebP,
                 backend: config.backend,
+                gpu: config.gpu_options,
                 threading: threading_for_threads(resolved_threads),
                 execution_profile: config.profile,
                 memory_budget: config.memory_budget,
@@ -1146,7 +1205,7 @@ fn format_unknown_blocks(diagnostics: &RenderDiagnostics, limit: usize) -> Strin
 
 fn print_pipeline_stats(dimension: Dimension, mode: RenderMode, stats: &RenderPipelineStats) {
     println!(
-        "{} {} stats planned_tiles={} planned_regions={} unique_chunks={} baked_chunks={} baked_regions={} cache_hits={} cache_misses={} region_hits={} region_misses={} bake_ms={} region_bake_ms={} tile_compose_ms={} encode_ms={} write_ms={} idle_ms={} queue_wait_ms={} peak_cache_bytes={} active_tasks_peak={} peak_worker_threads={} backend={} gpu_tiles={} cpu_tiles={} gpu_fallbacks={} gpu_upload_ms={} gpu_dispatch_ms={} gpu_readback_ms={} gpu_adapter={} gpu_fallback_reason={}",
+        "{} {} stats planned_tiles={} planned_regions={} unique_chunks={} baked_chunks={} baked_regions={} cache_hits={} cache_misses={} region_hits={} region_misses={} bake_ms={} region_bake_ms={} tile_compose_ms={} encode_ms={} write_ms={} idle_ms={} queue_wait_ms={} cpu_queue_wait_ms={} peak_cache_bytes={} active_tasks_peak={} peak_worker_threads={} backend={} gpu_tiles={} cpu_tiles={} gpu_fallbacks={} gpu_upload_ms={} gpu_dispatch_ms={} gpu_readback_ms={} gpu_batches={} gpu_batch_tiles={} gpu_max_in_flight={} gpu_queue_wait_ms={} gpu_worker_threads={} gpu_submit_workers={} gpu_buffer_reuses={} gpu_buffer_allocations={} gpu_staging_reuses={} gpu_staging_allocations={} gpu_adapter={} gpu_fallback_reason={}",
         dimension_slug(dimension),
         mode_slug(mode),
         stats.planned_tiles,
@@ -1165,6 +1224,7 @@ fn print_pipeline_stats(dimension: Dimension, mode: RenderMode, stats: &RenderPi
         stats.write_ms,
         stats.worker_idle_ms,
         stats.queue_wait_ms,
+        stats.cpu_queue_wait_ms,
         stats.peak_cache_bytes,
         stats.active_tasks_peak,
         stats.peak_worker_threads,
@@ -1175,6 +1235,16 @@ fn print_pipeline_stats(dimension: Dimension, mode: RenderMode, stats: &RenderPi
         stats.gpu_upload_ms,
         stats.gpu_dispatch_ms,
         stats.gpu_readback_ms,
+        stats.gpu_batches,
+        stats.gpu_batch_tiles,
+        stats.gpu_max_in_flight,
+        stats.gpu_queue_wait_ms,
+        stats.gpu_worker_threads,
+        stats.gpu_submit_workers,
+        stats.gpu_buffer_reuses,
+        stats.gpu_buffer_allocations,
+        stats.gpu_staging_reuses,
+        stats.gpu_staging_allocations,
         stats.gpu_adapter_name.as_deref().unwrap_or("none"),
         stats.gpu_fallback_reason.as_deref().unwrap_or("none")
     );
@@ -1490,7 +1560,7 @@ fn write_map_layout(
             json.push_str("        {");
             let _ = write!(
                 json,
-                "\"id\":\"{}\",\"label\":\"{}\",\"tiles\":{},\"rendered\":{},\"missingChunks\":{},\"transparentPixels\":{},\"unknownBlocks\":{},\"plannedRegions\":{},\"uniqueChunks\":{},\"bakedChunks\":{},\"bakedRegions\":{},\"regionBakeMs\":{},\"tileComposeMs\":{},\"bakeMs\":{},\"encodeMs\":{},\"peakCacheBytes\":{},\"activeTasksPeak\":{},\"peakWorkerThreads\":{},\"backend\":\"{}\",\"gpuTiles\":{},\"cpuTiles\":{},\"gpuFallbacks\":{}",
+                "\"id\":\"{}\",\"label\":\"{}\",\"tiles\":{},\"rendered\":{},\"missingChunks\":{},\"transparentPixels\":{},\"unknownBlocks\":{},\"plannedRegions\":{},\"uniqueChunks\":{},\"bakedChunks\":{},\"bakedRegions\":{},\"regionBakeMs\":{},\"tileComposeMs\":{},\"bakeMs\":{},\"encodeMs\":{},\"peakCacheBytes\":{},\"activeTasksPeak\":{},\"peakWorkerThreads\":{},\"backend\":\"{}\",\"gpuTiles\":{},\"cpuTiles\":{},\"gpuFallbacks\":{},\"gpuBatches\":{},\"gpuBatchTiles\":{},\"gpuMaxInFlight\":{},\"gpuQueueWaitMs\":{},\"gpuWorkerThreads\":{},\"gpuSubmitWorkers\":{},\"gpuBufferReuses\":{},\"gpuBufferAllocations\":{},\"gpuStagingReuses\":{},\"gpuStagingAllocations\":{}",
                 mode_slug(mode.mode),
                 mode_label(mode.mode),
                 mode.tile_count,
@@ -1512,7 +1582,17 @@ fn write_map_layout(
                 mode.stats.resolved_backend.label(),
                 mode.stats.gpu_tiles,
                 mode.stats.cpu_tiles,
-                mode.stats.gpu_fallbacks
+                mode.stats.gpu_fallbacks,
+                mode.stats.gpu_batches,
+                mode.stats.gpu_batch_tiles,
+                mode.stats.gpu_max_in_flight,
+                mode.stats.gpu_queue_wait_ms,
+                mode.stats.gpu_worker_threads,
+                mode.stats.gpu_submit_workers,
+                mode.stats.gpu_buffer_reuses,
+                mode.stats.gpu_buffer_allocations,
+                mode.stats.gpu_staging_reuses,
+                mode.stats.gpu_staging_allocations
             );
             json.push('}');
             if mode_index + 1 != dimension.modes.len() {
@@ -1903,6 +1983,16 @@ fn parse_u32(value: &str, name: &str) -> bedrock_render::Result<u32> {
     Ok(value)
 }
 
+fn parse_bool(value: &str) -> bedrock_render::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Ok(true),
+        "0" | "false" | "no" | "off" | "disabled" => Ok(false),
+        _ => Err(bedrock_render::BedrockRenderError::Validation(
+            "boolean value must be on/off or true/false".to_string(),
+        )),
+    }
+}
+
 fn parse_f32(value: &str, name: &str) -> bedrock_render::Result<f32> {
     let parsed = value.parse::<f32>().map_err(|error| {
         bedrock_render::BedrockRenderError::Validation(format!("invalid {name}: {error}"))
@@ -2146,6 +2236,7 @@ fn write_cache_manifest(config: &WebMapConfig) -> bedrock_render::Result<()> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn cache_signature(
     world_path: &std::path::Path,
     layout: RenderLayout,
@@ -2153,7 +2244,7 @@ fn cache_signature(
     surface_options: SurfaceRenderOptions,
     backend: RenderBackend,
     palette_json_paths: &[PathBuf],
-    palette_cache_path: Option<&PathBuf>,
+    extra_signature_salt: Option<&str>,
 ) -> bedrock_render::Result<String> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     RENDERER_CACHE_VERSION.hash(&mut hasher);
@@ -2243,6 +2334,42 @@ fn cache_signature(
         .underwater_min_light
         .to_bits()
         .hash(&mut hasher);
+    surface_options.block_boundaries.enabled.hash(&mut hasher);
+    surface_options
+        .block_boundaries
+        .strength
+        .to_bits()
+        .hash(&mut hasher);
+    surface_options
+        .block_boundaries
+        .flat_strength
+        .to_bits()
+        .hash(&mut hasher);
+    surface_options
+        .block_boundaries
+        .height_threshold
+        .to_bits()
+        .hash(&mut hasher);
+    surface_options
+        .block_boundaries
+        .max_shadow
+        .to_bits()
+        .hash(&mut hasher);
+    surface_options
+        .block_boundaries
+        .highlight_strength
+        .to_bits()
+        .hash(&mut hasher);
+    surface_options
+        .block_boundaries
+        .softness
+        .to_bits()
+        .hash(&mut hasher);
+    surface_options
+        .block_boundaries
+        .line_width_pixels
+        .to_bits()
+        .hash(&mut hasher);
     backend.cache_slug().hash(&mut hasher);
     GPU_COMPOSE_SHADER_VERSION.hash(&mut hasher);
     hash_file_signature(&mut hasher, &world_path.join("level.dat"))?;
@@ -2251,8 +2378,8 @@ fn cache_signature(
     for path in palette_json_paths {
         hash_file_signature(&mut hasher, path)?;
     }
-    if let Some(path) = palette_cache_path {
-        hash_file_signature(&mut hasher, path)?;
+    if let Some(salt) = extra_signature_salt {
+        salt.hash(&mut hasher);
     }
     Ok(format!("{:016x}", hasher.finish()))
 }
@@ -2326,9 +2453,16 @@ fn print_help() {
     println!("  --underwater-relief off|soft|strong");
     println!("  --underwater-relief-strength value --underwater-depth-fade value");
     println!("  --underwater-min-light value");
+    println!("  --block-boundaries on|off --block-boundary-strength value");
+    println!("  --block-boundary-flat-strength value --block-boundary-threshold value");
+    println!("  --block-boundary-max-shadow value --block-boundary-line-width value");
     println!("  --region min_x,min_z,max_x,max_z --threads auto|1..512");
     println!("  --max-render-threads N --reserve-threads N");
     println!("  --gpu auto|on|off --profile export|interactive");
+    println!("  --gpu-min-pixels N --gpu-max-in-flight 0|N");
+    println!("  --gpu-batch-size 0|N --gpu-batch-pixels 0|N");
+    println!("  --gpu-submit-workers 0|N --gpu-readback-workers 0|N");
+    println!("  --gpu-buffer-pool-bytes 0|N --gpu-staging-pool-bytes 0|N");
     println!("  --memory-budget auto|disabled|MiB --pipeline-depth N");
     println!("  --tile-batch-size auto|N --writer-threads N --write-queue-capacity N");
     println!("  --viewer-prefetch-radius N --viewer-retain-radius N --viewer-max-image-loads N");
@@ -2337,7 +2471,7 @@ fn print_help() {
     println!("  --cache-validation --no-cache-validation");
     println!("  --stats");
     println!("  --palette-json <optional-owned-palette.json>");
-    println!("  --palette-cache <optional-cache.brpal> --rebuild-palette-cache --force");
+    println!("  --force");
     println!("If --region is omitted, the loaded chunk bounds are rendered.");
     println!("External palette JSON is optional; the renderer has a built-in palette.");
 }
@@ -2633,6 +2767,38 @@ mod tests {
     }
 
     #[test]
+    fn cache_signature_changes_with_block_boundaries() {
+        let layout = RenderLayout::default();
+        let region_layout = RegionLayout::default();
+        let soft = SurfaceRenderOptions::default();
+        let mut outlined = SurfaceRenderOptions::default();
+        outlined.block_boundaries.strength = 0.85;
+        outlined.block_boundaries.flat_strength = 0.25;
+        let world_path = default_world_path();
+        let soft_signature = cache_signature(
+            &world_path,
+            layout,
+            region_layout,
+            soft,
+            RenderBackend::Auto,
+            &[],
+            None,
+        )
+        .expect("soft");
+        let outlined_signature = cache_signature(
+            &world_path,
+            layout,
+            region_layout,
+            outlined,
+            RenderBackend::Auto,
+            &[],
+            None,
+        )
+        .expect("outlined");
+        assert_ne!(soft_signature, outlined_signature);
+    }
+
+    #[test]
     fn cache_signature_changes_with_gpu_backend() {
         let layout = RenderLayout::default();
         let region_layout = RegionLayout::default();
@@ -2734,6 +2900,7 @@ mod tests {
             layout: RenderLayout::default(),
             region_layout: RegionLayout::default(),
             surface_options: SurfaceRenderOptions::default(),
+            gpu_options: RenderGpuOptions::default(),
             region: None,
             threading: RenderThreadingOptions::Auto,
             backend: RenderBackend::Auto,
@@ -2742,8 +2909,6 @@ mod tests {
             pipeline_depth: 0,
             print_stats: false,
             palette_json_paths: Vec::new(),
-            palette_cache_path: None,
-            rebuild_palette_cache: false,
             plugin_data_paths: Vec::new(),
             viewer_prefetch_radius: 1,
             viewer_retain_radius: 2,

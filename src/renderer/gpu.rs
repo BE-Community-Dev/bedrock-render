@@ -1,6 +1,7 @@
 use super::pipeline::{GpuTileComposeInput, GpuTileComposeOutput};
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::ops::Deref;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -31,7 +32,18 @@ struct Params {
     light_y: f32,
     light_z: f32,
     flat_dot: f32,
-    _pad1: f32,
+    pixels_per_block: u32,
+    blocks_per_pixel: u32,
+    block_boundary_enabled: u32,
+    _pad1: u32,
+    block_boundary_strength: f32,
+    block_boundary_flat_strength: f32,
+    block_boundary_height_threshold: f32,
+    block_boundary_max_shadow: f32,
+    block_boundary_highlight_strength: f32,
+    block_boundary_softness: f32,
+    block_boundary_line_width_pixels: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0) var<storage, read> colors: array<u32>;
@@ -94,6 +106,47 @@ fn edge_relief(base: u32, threshold: f32) -> vec2<f32> {
         return vec2<f32>(amount, amount * 0.25);
     }
     return vec2<f32>(amount * 0.45, amount);
+}
+
+fn block_boundary_relief(base: u32, threshold: f32, softness: f32) -> vec2<f32> {
+    let center = f32(heights[base]);
+    var higher_neighbor_delta = 0.0;
+    var lower_neighbor_delta = 0.0;
+    for (var index = 1u; index < 9u; index = index + 1u) {
+        let delta = f32(heights[base + index]) - center;
+        higher_neighbor_delta = max(higher_neighbor_delta, delta);
+        lower_neighbor_delta = max(lower_neighbor_delta, -delta);
+    }
+    let max_delta = max(higher_neighbor_delta, lower_neighbor_delta);
+    let safe_threshold = max(threshold, 0.0);
+    if (max_delta <= safe_threshold) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let delta = max_delta - safe_threshold;
+    let amount = clamp(delta / (delta + max(softness, 0.001)), 0.0, 1.0);
+    let pit_edge = higher_neighbor_delta >= lower_neighbor_delta;
+    if (pit_edge) {
+        return vec2<f32>(amount, amount * 0.25);
+    }
+    return vec2<f32>(amount * 0.45, amount);
+}
+
+fn block_boundary_line_factor(pixel_index: u32) -> f32 {
+    if (params.blocks_per_pixel != 1u) {
+        return -1.0;
+    }
+    if (params.pixels_per_block <= 1u) {
+        return 1.0;
+    }
+    let pixels_per_block = f32(params.pixels_per_block);
+    let pixel_x = pixel_index % params.width;
+    let pixel_z = pixel_index / params.width;
+    let local_x = f32(pixel_x % params.pixels_per_block) + 0.5;
+    let local_z = f32(pixel_z % params.pixels_per_block) + 0.5;
+    let edge_distance = min(min(local_x, pixels_per_block - local_x), min(local_z, pixels_per_block - local_z));
+    let width = clamp(params.block_boundary_line_width_pixels, 0.25, max(pixels_per_block * 0.5, 0.25));
+    let softness = clamp(params.block_boundary_softness, 0.25, 2.0);
+    return clamp((width + softness - edge_distance) / softness, 0.0, 1.0);
 }
 
 fn terrain_lit_color(color: u32, pixel_index: u32) -> u32 {
@@ -165,6 +218,30 @@ fn terrain_lit_color(color: u32, pixel_index: u32) -> u32 {
         }
         factor = factor + edge_highlight - edge_shadow;
     }
+    if (params.block_boundary_enabled != 0u && params.block_boundary_strength > 0.0) {
+        let line_factor = block_boundary_line_factor(pixel_index);
+        if (line_factor >= 0.0) {
+            let boundary = block_boundary_relief(
+                base,
+                params.block_boundary_height_threshold,
+                params.block_boundary_softness
+            );
+            let water_factor = select(1.0, 0.45, water_depth > 0u);
+            var flat_shadow = 0.0;
+            if (params.pixels_per_block > 1u) {
+                flat_shadow = line_factor * max(params.block_boundary_flat_strength, 0.0);
+            }
+            let edge_shadow = boundary.x * line_factor * max(params.block_boundary_strength, 0.0);
+            let boundary_shadow = (flat_shadow + edge_shadow) * max(params.block_boundary_max_shadow, 0.0) * water_factor;
+            let boundary_highlight = boundary.y
+                * line_factor
+                * max(params.block_boundary_strength, 0.0)
+                * max(params.block_boundary_highlight_strength, 0.0)
+                * 100.0
+                * water_factor;
+            factor = factor + boundary_highlight - boundary_shadow;
+        }
+    }
     let factor_i = i32(clamp(round(factor), -max_shadow, 55.0));
     return pack_color(
         shade_channel(channel(color, 0u), factor_i),
@@ -210,7 +287,18 @@ struct GpuParams {
     light_y: f32,
     light_z: f32,
     flat_dot: f32,
-    _pad1: f32,
+    pixels_per_block: u32,
+    blocks_per_pixel: u32,
+    block_boundary_enabled: u32,
+    _pad1: u32,
+    block_boundary_strength: f32,
+    block_boundary_flat_strength: f32,
+    block_boundary_height_threshold: f32,
+    block_boundary_max_shadow: f32,
+    block_boundary_highlight_strength: f32,
+    block_boundary_softness: f32,
+    block_boundary_line_width_pixels: f32,
+    _pad2: f32,
 }
 
 struct GpuRenderer {
@@ -219,7 +307,52 @@ struct GpuRenderer {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     adapter_name: String,
-    dispatch_lock: Mutex<()>,
+    in_flight: Mutex<usize>,
+    in_flight_available: Condvar,
+    buffer_pool: Mutex<GpuBufferPool>,
+}
+
+pub(super) struct GpuComposeExecutor {
+    renderer: Arc<GpuRenderer>,
+    max_in_flight: usize,
+    batch_size: usize,
+    readback_workers: usize,
+    submit_workers: usize,
+    batch_pixels: usize,
+}
+
+struct GpuPermit {
+    renderer: Arc<GpuRenderer>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GpuBufferKind {
+    Storage,
+    Staging,
+}
+
+struct PooledGpuBuffer {
+    buffer: wgpu::Buffer,
+    size: u64,
+    usage: wgpu::BufferUsages,
+}
+
+#[derive(Default)]
+struct GpuBufferPool {
+    storage: Vec<PooledGpuBuffer>,
+    staging: Vec<PooledGpuBuffer>,
+    storage_bytes: u64,
+    staging_bytes: u64,
+    storage_budget: u64,
+    staging_budget: u64,
+}
+
+struct GpuBufferLease {
+    buffer: Option<wgpu::Buffer>,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    kind: GpuBufferKind,
+    renderer: Arc<GpuRenderer>,
 }
 
 static GPU_RENDERER: OnceLock<Result<Arc<GpuRenderer>, String>> = OnceLock::new();
@@ -232,93 +365,150 @@ pub(super) fn compose_tile(
     input: &GpuTileComposeInput<'_>,
 ) -> Result<GpuTileComposeOutput, String> {
     validate_input(input)?;
-    let renderer = renderer()?;
-    let dispatch_guard = renderer
-        .dispatch_lock
-        .lock()
-        .map_err(|_| "gpu renderer dispatch lock was poisoned".to_string())?;
-    let upload_start = Instant::now();
-    let color_buffer = renderer.storage_buffer("bedrock-render gpu colors", input.colors)?;
-    let height_buffer = renderer.storage_buffer("bedrock-render gpu heights", input.heights)?;
-    let water_buffer =
-        renderer.storage_buffer("bedrock-render gpu water depths", input.water_depths)?;
-    let params = params_for_input(input)?;
-    let params_buffer = renderer.uniform_buffer("bedrock-render gpu params", &[params])?;
-    let output_size = buffer_size_for_len(input.colors.len(), std::mem::size_of::<u32>())?;
-    let output_buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bedrock-render gpu output"),
-        size: output_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let staging_buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("bedrock-render gpu readback"),
-        size: output_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let bind_group_layout = renderer.pipeline.get_bind_group_layout(0);
-    let bind_group = renderer
-        .device
-        .create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bedrock-render gpu compose bind group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: color_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: height_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: water_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: output_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-    let upload_ms = upload_start.elapsed().as_millis();
+    GpuComposeExecutor::new(input)?.compose_tile(input)
+}
 
-    let dispatch_start = Instant::now();
-    let mut encoder = renderer
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bedrock-render gpu compose encoder"),
-        });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("bedrock-render gpu compose pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&renderer.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        let workgroups = params.pixel_count.div_ceil(WORKGROUP_SIZE);
-        pass.dispatch_workgroups(workgroups, 1, 1);
+impl GpuComposeExecutor {
+    fn new(input: &GpuTileComposeInput<'_>) -> Result<Self, String> {
+        let renderer = renderer()?;
+        renderer.configure_pool(input.buffer_pool_bytes, input.staging_pool_bytes)?;
+        Ok(Self {
+            renderer,
+            max_in_flight: input.max_in_flight.max(1),
+            batch_size: input.batch_size.max(1),
+            readback_workers: input.readback_workers.max(1),
+            submit_workers: input.submit_workers.max(1),
+            batch_pixels: input.batch_pixels.max(1),
+        })
     }
-    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
-    renderer.queue.submit([encoder.finish()]);
-    let dispatch_ms = dispatch_start.elapsed().as_millis();
 
-    let readback_start = Instant::now();
-    let rgba = read_buffer(&renderer.device, &staging_buffer)?;
-    drop(dispatch_guard);
-    let readback_ms = readback_start.elapsed().as_millis();
-    Ok(GpuTileComposeOutput {
-        rgba,
-        upload_ms,
-        dispatch_ms,
-        readback_ms,
-        adapter_name: renderer.adapter_name.clone(),
-    })
+    fn compose_tile(
+        &self,
+        input: &GpuTileComposeInput<'_>,
+    ) -> Result<GpuTileComposeOutput, String> {
+        let renderer = &self.renderer;
+        let batches = self.batch_count_for_tiles(1);
+        let queue_wait_start = Instant::now();
+        let _permit = renderer.acquire_permit(self.max_in_flight)?;
+        let queue_wait_ms = queue_wait_start.elapsed().as_millis();
+        let upload_start = Instant::now();
+        let storage_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let (color_buffer, color_reused) = renderer.pooled_buffer_with_data(
+            "bedrock-render gpu colors",
+            storage_usage,
+            input.colors,
+        )?;
+        let (height_buffer, height_reused) = renderer.pooled_buffer_with_data(
+            "bedrock-render gpu heights",
+            storage_usage,
+            input.heights,
+        )?;
+        let (water_buffer, water_reused) = renderer.pooled_buffer_with_data(
+            "bedrock-render gpu water depths",
+            storage_usage,
+            input.water_depths,
+        )?;
+        let params = params_for_input(input)?;
+        let params_buffer = renderer.uniform_buffer("bedrock-render gpu params", &[params])?;
+        let output_size = buffer_size_for_len(input.colors.len(), std::mem::size_of::<u32>())?;
+        let (output_buffer, output_reused) = renderer.pooled_empty_buffer(
+            "bedrock-render gpu output",
+            GpuBufferKind::Storage,
+            output_size,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        )?;
+        let (staging_buffer, staging_reused) = renderer.pooled_empty_buffer(
+            "bedrock-render gpu readback",
+            GpuBufferKind::Staging,
+            output_size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        )?;
+        let bind_group_layout = renderer.pipeline.get_bind_group_layout(0);
+        let bind_group = renderer
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bedrock-render gpu compose bind group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: color_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: height_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: water_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        let upload_ms = upload_start.elapsed().as_millis();
+
+        let dispatch_start = Instant::now();
+        let mut encoder = renderer
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bedrock-render gpu compose encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("bedrock-render gpu compose pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&renderer.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = params.pixel_count.div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
+        renderer.queue.submit([encoder.finish()]);
+        let dispatch_ms = dispatch_start.elapsed().as_millis();
+
+        let readback_start = Instant::now();
+        let rgba = read_buffer(&renderer.device, &staging_buffer, output_size)?;
+        let readback_ms = readback_start.elapsed().as_millis();
+        let buffer_reuses = usize::from(color_reused)
+            + usize::from(height_reused)
+            + usize::from(water_reused)
+            + usize::from(output_reused);
+        let staging_reuses = usize::from(staging_reused);
+        Ok(GpuTileComposeOutput {
+            rgba,
+            upload_ms,
+            dispatch_ms,
+            readback_ms,
+            queue_wait_ms,
+            batches,
+            batch_tiles: 1,
+            max_in_flight: self.max_in_flight,
+            worker_threads: self.readback_workers,
+            submit_workers: self.submit_workers,
+            buffer_reuses,
+            buffer_allocations: 4usize.saturating_sub(buffer_reuses),
+            buffer_evictions: 0,
+            staging_reuses,
+            staging_allocations: 1usize.saturating_sub(staging_reuses),
+            staging_evictions: 0,
+            adapter_name: renderer.adapter_name.clone(),
+        })
+    }
+
+    fn batch_count_for_tiles(&self, tile_count: usize) -> usize {
+        tile_count
+            .div_ceil(self.batch_size.max(1))
+            .max(tile_count.div_ceil(self.batch_pixels.max(1)))
+            .max(1)
+    }
 }
 
 fn renderer() -> Result<Arc<GpuRenderer>, String> {
@@ -369,24 +559,104 @@ impl GpuRenderer {
                 "{} ({:?}, {:?})",
                 adapter_info.name, adapter_info.backend, adapter_info.device_type
             ),
-            dispatch_lock: Mutex::new(()),
+            in_flight: Mutex::new(0),
+            in_flight_available: Condvar::new(),
+            buffer_pool: Mutex::new(GpuBufferPool::default()),
         })
     }
 
-    fn storage_buffer<T: bytemuck::Pod>(
-        &self,
+    fn configure_pool(&self, storage_budget: usize, staging_budget: usize) -> Result<(), String> {
+        let mut pool = self
+            .buffer_pool
+            .lock()
+            .map_err(|_| "gpu buffer pool lock was poisoned".to_string())?;
+        pool.storage_budget = u64::try_from(storage_budget)
+            .map_err(|_| "gpu storage buffer pool budget exceeds u64".to_string())?;
+        pool.staging_budget = u64::try_from(staging_budget)
+            .map_err(|_| "gpu staging buffer pool budget exceeds u64".to_string())?;
+        pool.evict_to_budgets();
+        Ok(())
+    }
+
+    fn acquire_permit(self: &Arc<Self>, max_in_flight: usize) -> Result<GpuPermit, String> {
+        let mut active = self
+            .in_flight
+            .lock()
+            .map_err(|_| "gpu in-flight lock was poisoned".to_string())?;
+        while *active >= max_in_flight {
+            active = self
+                .in_flight_available
+                .wait(active)
+                .map_err(|_| "gpu in-flight lock was poisoned".to_string())?;
+        }
+        *active = active.saturating_add(1);
+        Ok(GpuPermit {
+            renderer: Arc::clone(self),
+        })
+    }
+
+    fn pooled_buffer_with_data<T: bytemuck::Pod>(
+        self: &Arc<Self>,
         label: &'static str,
+        usage: wgpu::BufferUsages,
         values: &[T],
-    ) -> Result<wgpu::Buffer, String> {
+    ) -> Result<(GpuBufferLease, bool), String> {
         let bytes = bytemuck::cast_slice(values);
+        let size = buffer_size_for_bytes(bytes)?;
+        let (buffer, reused) =
+            self.pooled_empty_buffer(label, GpuBufferKind::Storage, size, usage)?;
+        self.queue.write_buffer(&buffer, 0, bytes);
+        Ok((buffer, reused))
+    }
+
+    fn pooled_empty_buffer(
+        self: &Arc<Self>,
+        label: &'static str,
+        kind: GpuBufferKind,
+        size: u64,
+        usage: wgpu::BufferUsages,
+    ) -> Result<(GpuBufferLease, bool), String> {
+        if let Some(pooled) = self.take_pooled_buffer(kind, size, usage)? {
+            return Ok((
+                GpuBufferLease {
+                    buffer: Some(pooled.buffer),
+                    size: pooled.size,
+                    usage,
+                    kind,
+                    renderer: Arc::clone(self),
+                },
+                true,
+            ));
+        }
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: buffer_size_for_bytes(bytes)?,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            size,
+            usage,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&buffer, 0, bytes);
-        Ok(buffer)
+        Ok((
+            GpuBufferLease {
+                buffer: Some(buffer),
+                size,
+                usage,
+                kind,
+                renderer: Arc::clone(self),
+            },
+            false,
+        ))
+    }
+
+    fn take_pooled_buffer(
+        &self,
+        kind: GpuBufferKind,
+        size: u64,
+        usage: wgpu::BufferUsages,
+    ) -> Result<Option<PooledGpuBuffer>, String> {
+        let mut pool = self
+            .buffer_pool
+            .lock()
+            .map_err(|_| "gpu buffer pool lock was poisoned".to_string())?;
+        Ok(pool.take(kind, size, usage))
     }
 
     fn uniform_buffer<T: bytemuck::Pod>(
@@ -403,6 +673,102 @@ impl GpuRenderer {
         });
         self.queue.write_buffer(&buffer, 0, bytes);
         Ok(buffer)
+    }
+}
+
+impl GpuBufferPool {
+    fn take(
+        &mut self,
+        kind: GpuBufferKind,
+        size: u64,
+        usage: wgpu::BufferUsages,
+    ) -> Option<PooledGpuBuffer> {
+        let (buffers, bytes) = self.pool_parts_mut(kind);
+        let index = buffers
+            .iter()
+            .position(|buffer| buffer.size >= size && buffer.usage == usage)?;
+        let buffer = buffers.swap_remove(index);
+        *bytes = bytes.saturating_sub(buffer.size);
+        Some(buffer)
+    }
+
+    fn put(&mut self, kind: GpuBufferKind, buffer: PooledGpuBuffer) {
+        let budget = self.budget(kind);
+        if budget == 0 || buffer.size > budget {
+            return;
+        }
+        let (buffers, bytes) = self.pool_parts_mut(kind);
+        *bytes = bytes.saturating_add(buffer.size);
+        buffers.push(buffer);
+        self.evict(kind);
+    }
+
+    fn evict_to_budgets(&mut self) {
+        self.evict(GpuBufferKind::Storage);
+        self.evict(GpuBufferKind::Staging);
+    }
+
+    fn evict(&mut self, kind: GpuBufferKind) {
+        let budget = self.budget(kind);
+        let (buffers, bytes) = self.pool_parts_mut(kind);
+        while *bytes > budget {
+            let Some(buffer) = (!buffers.is_empty()).then(|| buffers.remove(0)) else {
+                *bytes = 0;
+                break;
+            };
+            *bytes = bytes.saturating_sub(buffer.size);
+        }
+    }
+
+    fn budget(&self, kind: GpuBufferKind) -> u64 {
+        match kind {
+            GpuBufferKind::Storage => self.storage_budget,
+            GpuBufferKind::Staging => self.staging_budget,
+        }
+    }
+
+    fn pool_parts_mut(&mut self, kind: GpuBufferKind) -> (&mut Vec<PooledGpuBuffer>, &mut u64) {
+        match kind {
+            GpuBufferKind::Storage => (&mut self.storage, &mut self.storage_bytes),
+            GpuBufferKind::Staging => (&mut self.staging, &mut self.staging_bytes),
+        }
+    }
+}
+
+impl Deref for GpuBufferLease {
+    type Target = wgpu::Buffer;
+
+    fn deref(&self) -> &Self::Target {
+        self.buffer
+            .as_ref()
+            .expect("gpu buffer lease missing buffer")
+    }
+}
+
+impl Drop for GpuBufferLease {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        if let Ok(mut pool) = self.renderer.buffer_pool.lock() {
+            pool.put(
+                self.kind,
+                PooledGpuBuffer {
+                    buffer,
+                    size: self.size,
+                    usage: self.usage,
+                },
+            );
+        }
+    }
+}
+
+impl Drop for GpuPermit {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.renderer.in_flight.lock() {
+            *active = active.saturating_sub(1);
+            self.renderer.in_flight_available.notify_one();
+        }
     }
 }
 
@@ -426,6 +792,12 @@ fn validate_input(input: &GpuTileComposeInput<'_>) -> Result<(), String> {
             "gpu height-neighborhood buffer length does not match tile dimensions".to_string(),
         );
     }
+    if input.pixels_per_block == 0 {
+        return Err("gpu pixels_per_block must be greater than zero".to_string());
+    }
+    if input.blocks_per_pixel == 0 {
+        return Err("gpu blocks_per_pixel must be greater than zero".to_string());
+    }
     Ok(())
 }
 
@@ -445,6 +817,7 @@ fn params_for_input(input: &GpuTileComposeInput<'_>) -> Result<GpuParams, String
     let light_x = azimuth.sin() * light_horizontal;
     let light_y = elevation.sin();
     let light_z = -azimuth.cos() * light_horizontal;
+    let block_boundaries = input.block_boundaries;
     Ok(GpuParams {
         width: input.width,
         height: input.height,
@@ -469,12 +842,23 @@ fn params_for_input(input: &GpuTileComposeInput<'_>) -> Result<GpuParams, String
         light_y,
         light_z,
         flat_dot: light_y,
-        _pad1: 0.0,
+        pixels_per_block: input.pixels_per_block,
+        blocks_per_pixel: input.blocks_per_pixel,
+        block_boundary_enabled: u32::from(block_boundaries.enabled),
+        _pad1: 0,
+        block_boundary_strength: block_boundaries.strength,
+        block_boundary_flat_strength: block_boundaries.flat_strength,
+        block_boundary_height_threshold: block_boundaries.height_threshold,
+        block_boundary_max_shadow: block_boundaries.max_shadow,
+        block_boundary_highlight_strength: block_boundaries.highlight_strength,
+        block_boundary_softness: block_boundaries.softness,
+        block_boundary_line_width_pixels: block_boundaries.line_width_pixels,
+        _pad2: 0.0,
     })
 }
 
-fn read_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>, String> {
-    let slice = buffer.slice(..);
+fn read_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer, size: u64) -> Result<Vec<u8>, String> {
+    let slice = buffer.slice(0..size);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let send_result = sender.send(result.map_err(|error| error.to_string()));
