@@ -1,7 +1,9 @@
+#![allow(clippy::too_many_lines)]
+
 #[cfg(feature = "webp")]
 use bedrock_render::{
     ChunkRegion, MapRenderSession, MapRenderSessionConfig, RenderCachePolicy,
-    RenderExecutionProfile, RenderLayout, RenderThreadingOptions, TileStreamEvent,
+    RenderExecutionProfile, RenderLayout, RenderThreadingOptions, TileReadySource, TileStreamEvent,
 };
 use bedrock_render::{
     ImageFormat, MapRenderer, RenderJob, RenderMode, RenderOptions, RenderPalette, TileCoord,
@@ -90,12 +92,13 @@ fn streaming_session_emits_rendered_then_cached_events() {
         blocks_per_pixel: 16,
         pixels_per_block: 1,
     };
-    let planned_tiles = MapRenderer::plan_region_tiles(
-        ChunkRegion::new(Dimension::Overworld, 0, 0, 0, 0),
-        RenderMode::Biome { y: 64 },
-        layout,
-    )
-    .expect("plan tile");
+    let planned_tiles =
+        MapRenderer::<std::sync::Arc<dyn bedrock_world::WorldStorage>>::plan_region_tiles(
+            ChunkRegion::new(Dimension::Overworld, 0, 0, 0, 0),
+            RenderMode::Biome { y: 64 },
+            layout,
+        )
+        .expect("plan tile");
     assert_eq!(planned_tiles.len(), 1);
 
     let rendered_tiles = Arc::new(AtomicUsize::new(0));
@@ -105,7 +108,7 @@ fn streaming_session_emits_rendered_then_cached_events() {
         .render_web_tiles_streaming_blocking(
             &planned_tiles,
             RenderOptions {
-                format: ImageFormat::WebP,
+                format: ImageFormat::FastRgbaZstd,
                 threading: RenderThreadingOptions::Single,
                 execution_profile: RenderExecutionProfile::Interactive,
                 cache_policy: RenderCachePolicy::Use,
@@ -116,7 +119,10 @@ fn streaming_session_emits_rendered_then_cached_events() {
                 let complete = Arc::clone(&complete);
                 move |event| {
                     match event {
-                        TileStreamEvent::Rendered { .. } => {
+                        TileStreamEvent::Ready {
+                            source: TileReadySource::Render,
+                            ..
+                        } => {
                             rendered_tiles.fetch_add(1, Ordering::Relaxed);
                         }
                         TileStreamEvent::Complete { .. } => {
@@ -136,7 +142,7 @@ fn streaming_session_emits_rendered_then_cached_events() {
         .render_web_tiles_streaming_blocking(
             &planned_tiles,
             RenderOptions {
-                format: ImageFormat::WebP,
+                format: ImageFormat::FastRgbaZstd,
                 threading: RenderThreadingOptions::Single,
                 execution_profile: RenderExecutionProfile::Interactive,
                 cache_policy: RenderCachePolicy::Use,
@@ -147,8 +153,12 @@ fn streaming_session_emits_rendered_then_cached_events() {
                 let complete = Arc::clone(&complete);
                 move |event| {
                     match event {
-                        TileStreamEvent::Cached { encoded, .. } => {
-                            assert!(!encoded.is_empty());
+                        TileStreamEvent::Ready {
+                            tile,
+                            source: TileReadySource::MemoryCache | TileReadySource::DiskCacheFresh,
+                            ..
+                        } => {
+                            assert!(!tile.rgba.is_empty());
                             cached.fetch_add(1, Ordering::Relaxed);
                         }
                         TileStreamEvent::Complete { .. } => {

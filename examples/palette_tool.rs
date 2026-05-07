@@ -888,6 +888,9 @@ fn ensure_semantic_colors(block: &Value, biome: &Value) -> Result<()> {
     ensure_neutral_mask(leaves_mask, "minecraft:oak_leaves")?;
     let water_mask = required_block_color(block, "minecraft:water")?;
     ensure_water_mask(water_mask, "minecraft:water")?;
+    let red_sand = required_block_color(block, "minecraft:red_sand")?;
+    ensure_red_sand(red_sand, "minecraft:red_sand")?;
+    ensure_sand_state_colors(block)?;
 
     let plains = final_tinted(grass_mask, required_biome_color(biome, "plains", "grass")?);
     let desert = final_tinted(grass_mask, required_biome_color(biome, "desert", "grass")?);
@@ -1062,6 +1065,61 @@ fn ensure_water_mask(color: Rgba, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_red_sand(color: Rgba, label: &str) -> Result<()> {
+    if !(color.red > color.green
+        && color.green > color.blue
+        && color.red.saturating_sub(color.blue) >= 100)
+    {
+        return Err(validation(format!("{label} should read as red sand")));
+    }
+    Ok(())
+}
+
+fn ensure_sand_state_colors(value: &Value) -> Result<()> {
+    let blocks = value
+        .get("blocks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| validation("block palette JSON must contain a blocks object"))?;
+    let sand = blocks
+        .get("minecraft:sand")
+        .and_then(Value::as_object)
+        .ok_or_else(|| validation("block palette is missing `minecraft:sand`"))?;
+    let state_colors = sand
+        .get("state_colors")
+        .and_then(Value::as_object)
+        .ok_or_else(|| validation("minecraft:sand is missing state_colors"))?;
+    for key in ["sand_type", "sand_color", "variant", "data", "damage"] {
+        let rules = state_colors
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| validation(format!("minecraft:sand.state_colors.{key} is missing")))?;
+        let has_numeric_red = rules.iter().any(|rule| {
+            rule.as_object().is_some_and(|rule| {
+                rule.get("min").and_then(Value::as_i64) == Some(1)
+                    && rule.get("max").and_then(Value::as_i64) == Some(1)
+                    && rule.get("color").is_some()
+            })
+        });
+        let has_named_red = rules.iter().any(|rule| {
+            rule.as_object()
+                .and_then(|rule| rule.get("values"))
+                .and_then(Value::as_array)
+                .is_some_and(|values| {
+                    values.iter().any(|value| value.as_str() == Some("red"))
+                        && values
+                            .iter()
+                            .any(|value| value.as_str() == Some("red_sand"))
+                })
+        });
+        if !has_numeric_red || !has_named_red {
+            return Err(validation(format!(
+                "minecraft:sand.state_colors.{key} must include red sand numeric and named rules"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn final_tinted(mask: Rgba, tint: Rgba) -> Rgba {
     Rgba::new(
         multiply_channel(mask.red, tint.red),
@@ -1166,6 +1224,7 @@ fn block_inventory(value: &Value) -> Result<BTreeSet<String>> {
         "minecraft:structure_void",
         "minecraft:light",
         "minecraft:light_block",
+        "minecraft:terracotta",
     ] {
         names.insert(name.to_string());
     }
@@ -1768,27 +1827,121 @@ fn clean_room_grass_tint_mask(name: &str) -> bool {
         || name.contains("vine")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DyeMaterial {
+    id: i32,
+    name: &'static str,
+    resource_token: &'static str,
+    color: Rgba,
+}
+
+const DYE_MATERIALS: &[DyeMaterial] = &[
+    DyeMaterial {
+        id: 0,
+        name: "white",
+        resource_token: "white",
+        color: Rgba::new(222, 226, 224, 255),
+    },
+    DyeMaterial {
+        id: 1,
+        name: "orange",
+        resource_token: "orange",
+        color: Rgba::new(211, 102, 28, 255),
+    },
+    DyeMaterial {
+        id: 2,
+        name: "magenta",
+        resource_token: "magenta",
+        color: Rgba::new(178, 75, 190, 255),
+    },
+    DyeMaterial {
+        id: 3,
+        name: "light_blue",
+        resource_token: "light_blue",
+        color: Rgba::new(73, 165, 205, 255),
+    },
+    DyeMaterial {
+        id: 4,
+        name: "yellow",
+        resource_token: "yellow",
+        color: Rgba::new(223, 181, 45, 255),
+    },
+    DyeMaterial {
+        id: 5,
+        name: "lime",
+        resource_token: "lime",
+        color: Rgba::new(112, 177, 45, 255),
+    },
+    DyeMaterial {
+        id: 6,
+        name: "pink",
+        resource_token: "pink",
+        color: Rgba::new(218, 128, 161, 255),
+    },
+    DyeMaterial {
+        id: 7,
+        name: "gray",
+        resource_token: "gray",
+        color: Rgba::new(76, 79, 78, 255),
+    },
+    DyeMaterial {
+        id: 8,
+        name: "light_gray",
+        resource_token: "silver",
+        color: Rgba::new(150, 151, 144, 255),
+    },
+    DyeMaterial {
+        id: 9,
+        name: "cyan",
+        resource_token: "cyan",
+        color: Rgba::new(37, 132, 139, 255),
+    },
+    DyeMaterial {
+        id: 10,
+        name: "purple",
+        resource_token: "purple",
+        color: Rgba::new(117, 65, 155, 255),
+    },
+    DyeMaterial {
+        id: 11,
+        name: "blue",
+        resource_token: "blue",
+        color: Rgba::new(57, 73, 151, 255),
+    },
+    DyeMaterial {
+        id: 12,
+        name: "brown",
+        resource_token: "brown",
+        color: Rgba::new(109, 74, 43, 255),
+    },
+    DyeMaterial {
+        id: 13,
+        name: "green",
+        resource_token: "green",
+        color: Rgba::new(82, 116, 49, 255),
+    },
+    DyeMaterial {
+        id: 14,
+        name: "red",
+        resource_token: "red",
+        color: Rgba::new(155, 54, 48, 255),
+    },
+    DyeMaterial {
+        id: 15,
+        name: "black",
+        resource_token: "black",
+        color: Rgba::new(31, 34, 38, 255),
+    },
+];
+
 fn dye_prefix(name: &str) -> Option<(&'static str, Rgba)> {
-    [
-        ("light_blue", Rgba::new(73, 165, 205, 255)),
-        ("light_gray", Rgba::new(150, 151, 144, 255)),
-        ("white", Rgba::new(222, 226, 224, 255)),
-        ("orange", Rgba::new(211, 102, 28, 255)),
-        ("magenta", Rgba::new(178, 75, 190, 255)),
-        ("yellow", Rgba::new(223, 181, 45, 255)),
-        ("lime", Rgba::new(112, 177, 45, 255)),
-        ("pink", Rgba::new(218, 128, 161, 255)),
-        ("gray", Rgba::new(76, 79, 78, 255)),
-        ("cyan", Rgba::new(37, 132, 139, 255)),
-        ("purple", Rgba::new(117, 65, 155, 255)),
-        ("blue", Rgba::new(57, 73, 151, 255)),
-        ("brown", Rgba::new(109, 74, 43, 255)),
-        ("green", Rgba::new(82, 116, 49, 255)),
-        ("red", Rgba::new(155, 54, 48, 255)),
-        ("black", Rgba::new(31, 34, 38, 255)),
-    ]
-    .into_iter()
-    .find(|(prefix, _)| name.starts_with(&format!("{prefix}_")))
+    dye_material_for_prefixed_name(name).map(|material| (material.name, material.color))
+}
+
+fn dye_material_for_prefixed_name(name: &str) -> Option<&'static DyeMaterial> {
+    DYE_MATERIALS
+        .iter()
+        .find(|material| name.starts_with(&format!("{}_", material.name)))
 }
 
 fn wood_family_color(name: &str) -> Rgba {
@@ -2405,6 +2558,9 @@ fn insert_special_resource_pack_colors(
     entry: &mut Map<String, Value>,
 ) -> Result<()> {
     let short_name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
+    insert_common_dyed_state_colors(pack_path, texture_paths, short_name, entry)?;
+    insert_sand_state_colors(pack_path, texture_paths, short_name, entry)?;
+    insert_candle_color(pack_path, texture_paths, short_name, entry)?;
     match short_name {
         "piston" => {
             if let Some(color) =
@@ -2457,6 +2613,9 @@ fn insert_special_resource_pack_colors(
         "standing_banner" | "wall_banner" => {
             insert_banner_variant_colors(pack_path, texture_paths, block_textures, entry)?;
         }
+        "bed" => {
+            insert_bed_variant_colors(pack_path, texture_paths, entry)?;
+        }
         "decorated_pot" => {
             insert_decorated_pot_colors(pack_path, texture_paths, entry)?;
         }
@@ -2468,6 +2627,160 @@ fn insert_special_resource_pack_colors(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(feature = "png")]
+fn insert_sand_state_colors(
+    pack_path: &Path,
+    texture_paths: &BTreeMap<String, Vec<String>>,
+    short_name: &str,
+    entry: &mut Map<String, Value>,
+) -> Result<()> {
+    if short_name != "sand" {
+        return Ok(());
+    }
+    let sand = average_first_existing_texture(
+        pack_path,
+        texture_paths,
+        &["sand".to_string()],
+        TextureChoice::First,
+    )?
+    .unwrap_or(Rgba::new(219, 207, 163, 255));
+    let red_sand = average_first_existing_texture(
+        pack_path,
+        texture_paths,
+        &["red_sand".to_string()],
+        TextureChoice::First,
+    )?
+    .unwrap_or(Rgba::new(190, 102, 33, 255));
+    let rules = json!([
+        {"min": 0, "max": 0, "color": color_value(sand)},
+        {"values": ["normal", "sand"], "color": color_value(sand)},
+        {"min": 1, "max": 1, "color": color_value(red_sand)},
+        {"values": ["red", "red_sand"], "color": color_value(red_sand)}
+    ]);
+    for key in ["sand_type", "sand_color", "variant", "data", "damage"] {
+        insert_state_color_rules(entry, key, rules.clone());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "png")]
+fn insert_common_dyed_state_colors(
+    pack_path: &Path,
+    texture_paths: &BTreeMap<String, Vec<String>>,
+    short_name: &str,
+    entry: &mut Map<String, Value>,
+) -> Result<()> {
+    let Some(family) = dyed_state_family(short_name) else {
+        return Ok(());
+    };
+    let mut colors = Vec::with_capacity(DYE_MATERIALS.len());
+    for material in DYE_MATERIALS {
+        let texture_names = dyed_state_texture_names(family, material);
+        let color = average_first_existing_texture(
+            pack_path,
+            texture_paths,
+            &texture_names,
+            TextureChoice::First,
+        )?
+        .unwrap_or(material.color);
+        colors.push((*material, color));
+    }
+    insert_dye_state_color_rules(entry, &colors);
+    Ok(())
+}
+
+#[cfg(feature = "png")]
+fn dyed_state_family(short_name: &str) -> Option<DyedStateFamily> {
+    match short_name {
+        "concrete" => Some(DyedStateFamily::Concrete),
+        "concretePowder" | "concrete_powder" => Some(DyedStateFamily::ConcretePowder),
+        "wool" | "carpet" => Some(DyedStateFamily::Wool),
+        "stained_glass" => Some(DyedStateFamily::StainedGlass),
+        "stained_glass_pane" => Some(DyedStateFamily::StainedGlassPane),
+        "shulker_box" => Some(DyedStateFamily::ShulkerBox),
+        "stained_hardened_clay" | "terracotta" => Some(DyedStateFamily::Terracotta),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "png")]
+#[derive(Clone, Copy)]
+enum DyedStateFamily {
+    Concrete,
+    ConcretePowder,
+    Wool,
+    StainedGlass,
+    StainedGlassPane,
+    ShulkerBox,
+    Terracotta,
+}
+
+#[cfg(feature = "png")]
+fn dyed_state_texture_names(family: DyedStateFamily, material: &DyeMaterial) -> Vec<String> {
+    let token = material.resource_token;
+    match family {
+        DyedStateFamily::Concrete => vec![format!("concrete_{token}")],
+        DyedStateFamily::ConcretePowder => vec![format!("concrete_powder_{token}")],
+        DyedStateFamily::Wool => vec![format!("wool_colored_{token}")],
+        DyedStateFamily::StainedGlass => vec![format!("glass_{token}")],
+        DyedStateFamily::StainedGlassPane => vec![format!("glass_pane_top_{token}")],
+        DyedStateFamily::ShulkerBox => vec![format!("shulker_top_{token}")],
+        DyedStateFamily::Terracotta => vec![format!("hardened_clay_stained_{token}")],
+    }
+}
+
+#[cfg(feature = "png")]
+fn insert_dye_state_color_rules(entry: &mut Map<String, Value>, colors: &[(DyeMaterial, Rgba)]) {
+    for key in [
+        "color",
+        "color_bit",
+        "color_index",
+        "dye_color",
+        "data",
+        "damage",
+        "variant",
+    ] {
+        insert_state_color_rules(entry, key, dye_state_rules(colors));
+    }
+}
+
+#[cfg(feature = "png")]
+fn dye_state_rules(colors: &[(DyeMaterial, Rgba)]) -> Value {
+    let mut rules = Vec::with_capacity(colors.len() * 2);
+    for (material, color) in colors {
+        rules.push(json!({
+            "min": material.id,
+            "max": material.id,
+            "color": color_value(*color),
+        }));
+        let mut values = vec![
+            material.name.to_string(),
+            material.resource_token.to_string(),
+        ];
+        if material.name == "light_gray" {
+            values.push("silver".to_string());
+        }
+        values.sort();
+        values.dedup();
+        rules.push(json!({
+            "values": values,
+            "color": color_value(*color),
+        }));
+    }
+    Value::Array(rules)
+}
+
+#[cfg(feature = "png")]
+fn insert_state_color_rules(entry: &mut Map<String, Value>, key: &str, rules: Value) {
+    let state_colors = entry
+        .entry("state_colors".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(state_colors) = state_colors.as_object_mut() else {
+        return;
+    };
+    state_colors.insert(key.to_string(), rules);
 }
 
 #[cfg(feature = "png")]
@@ -2511,6 +2824,44 @@ fn insert_banner_variant_colors(
 }
 
 #[cfg(feature = "png")]
+fn insert_bed_variant_colors(
+    pack_path: &Path,
+    texture_paths: &BTreeMap<String, Vec<String>>,
+    entry: &mut Map<String, Value>,
+) -> Result<()> {
+    let mut red = None;
+    let mut white = None;
+    let mut colors = Vec::with_capacity(DYE_MATERIALS.len());
+    for material in DYE_MATERIALS {
+        let texture_names = vec![
+            format!("textures/items/bed_{}", material.resource_token),
+            format!("textures/items/bed_{}", material.name),
+            format!("bed_{}", material.resource_token),
+            format!("bed_{}", material.name),
+        ];
+        let color = average_first_existing_texture(
+            pack_path,
+            texture_paths,
+            &texture_names,
+            TextureChoice::First,
+        )?
+        .unwrap_or(material.color);
+        if material.name == "red" {
+            red = Some(color);
+        } else if material.name == "white" {
+            white = Some(color);
+        }
+        insert_variant_color(entry, &format!("bed_{}", material.name), color);
+        colors.push((*material, color));
+    }
+    insert_dye_state_color_rules(entry, &colors);
+    if let Some(color) = red.or(white) {
+        set_resource_pack_special_color(entry, color);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "png")]
 fn insert_decorated_pot_colors(
     pack_path: &Path,
     texture_paths: &BTreeMap<String, Vec<String>>,
@@ -2541,6 +2892,54 @@ fn insert_decorated_pot_colors(
     );
     insert_variant_color(entry, "decorated_pot_base", color);
     Ok(())
+}
+
+#[cfg(feature = "png")]
+fn insert_candle_color(
+    pack_path: &Path,
+    texture_paths: &BTreeMap<String, Vec<String>>,
+    short_name: &str,
+    entry: &mut Map<String, Value>,
+) -> Result<()> {
+    if !is_candle_block(short_name) {
+        return Ok(());
+    }
+    let texture_names = vec![
+        short_name.to_string(),
+        format!("textures/blocks/{short_name}"),
+        format!("textures/items/{short_name}"),
+    ];
+    if let Some(color) = average_first_existing_texture(
+        pack_path,
+        texture_paths,
+        &texture_names,
+        TextureChoice::First,
+    )? {
+        set_resource_pack_special_color(entry, color);
+        return Ok(());
+    }
+    let color = candle_fallback_color(short_name);
+    entry.insert("default".to_string(), color_value(color));
+    entry.insert("clean_room_fallback".to_string(), color_value(color));
+    entry.insert(
+        "fallback_reason".to_string(),
+        Value::String("resource-pack-candle-texture-unresolved".to_string()),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "png")]
+fn is_candle_block(short_name: &str) -> bool {
+    short_name == "candle"
+        || short_name == "candle_cake"
+        || short_name.ends_with("_candle")
+        || short_name.ends_with("_candle_cake")
+}
+
+#[cfg(feature = "png")]
+fn candle_fallback_color(short_name: &str) -> Rgba {
+    dye_material_for_prefixed_name(short_name)
+        .map_or(Rgba::new(198, 158, 82, 255), |material| material.color)
 }
 
 #[cfg(feature = "png")]

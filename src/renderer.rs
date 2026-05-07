@@ -1,33 +1,28 @@
-#[cfg(feature = "gpu")]
 #[path = "renderer/gpu.rs"]
 mod gpu;
 #[path = "renderer/pipeline.rs"]
 mod pipeline;
-#[cfg(not(feature = "gpu"))]
-mod gpu {
-    use super::pipeline::{GpuTileComposeInput, GpuTileComposeOutput};
-
-    pub(super) fn compose_tile(
-        _input: &GpuTileComposeInput<'_>,
-    ) -> Result<GpuTileComposeOutput, String> {
-        Err("bedrock-render was built without the gpu feature".to_string())
-    }
-
-    pub(super) fn feature_enabled() -> bool {
-        false
-    }
-}
 
 pub use pipeline::{
-    BakeDiagnostics, BakeOptions, BlockBoundaryRenderOptions, ChunkBake, ChunkBakePayload,
-    ChunkRegion, ChunkTileLayout, DEFAULT_PALETTE_VERSION, DepthPlane, GPU_COMPOSE_SHADER_VERSION,
-    HeightPlane, ImageFormat, MAX_RENDER_THREADS, MAX_TILE_SIZE_PIXELS, MapRenderSession,
+    AtlasRenderOptions, BakeDiagnostics, BakeOptions, BlockBoundaryRenderOptions,
+    BlockVolumeRenderOptions, CHUNK_BAKE_CACHE_VERSION, ChunkBake, ChunkBakeCache,
+    ChunkBakeCacheKey, ChunkBakePayload, ChunkRegion, ChunkTileLayout, DEFAULT_PALETTE_VERSION,
+    DepthPlane, FastRgbaZstdHeader, FastRgbaZstdTile, HeightPlane, ImageFormat,
+    LevelDbRenderSource, MAX_RENDER_THREADS, MAX_TILE_SIZE_PIXELS, MapRenderSession,
     MapRenderSessionConfig, MapRenderer, PlannedTile, RENDERER_CACHE_VERSION, RegionBake,
     RegionBakePayload, RegionCoord, RegionLayout, RenderBackend, RenderCachePolicy,
-    RenderCancelFlag, RenderCpuPipelineOptions, RenderDiagnostics, RenderDiagnosticsSink,
-    RenderExecutionProfile, RenderGpuOptions, RenderJob, RenderLayout, RenderMemoryBudget,
-    RenderMode, RenderOptions, RenderPipelineStats, RenderProgress, RenderProgressSink,
-    RenderThreadingOptions, RenderTilePriority, RenderWebTilesResult, ResolvedRenderBackend,
-    RgbaPlane, SurfacePlane, SurfaceRenderOptions, TerrainLightingOptions, TerrainLightingPreset,
-    TileCache, TileCacheKey, TileCoord, TileImage, TilePathScheme, TileSet, TileStreamEvent,
+    RenderCancelFlag, RenderChunkSource, RenderCpuPipelineOptions, RenderDiagnostics,
+    RenderDiagnosticsSink, RenderExecutionProfile, RenderGpuBackend, RenderGpuDiagnostics,
+    RenderGpuFallbackPolicy, RenderGpuOptions, RenderGpuPipelineLevel, RenderJob, RenderLayout,
+    RenderMemoryBudget, RenderMode, RenderOptions, RenderPerformanceOptions,
+    RenderPerformanceProfile, RenderPipelineStats, RenderProgress, RenderProgressSink,
+    RenderSidecarCachePolicy, RenderSurfaceLoadPolicy, RenderTaskControl, RenderThreadingOptions,
+    RenderTilePriority, RenderWebTilesResult, ResolvedRenderBackend, RgbaPlane, SurfacePlane,
+    SurfacePlaneAtlas, SurfaceRenderOptions, TerrainLightingOptions, TerrainLightingPreset,
+    TileCache, TileCacheKey, TileCacheValidationOutcome, TileCoord, TileImage,
+    TileManifestProbeRequest, TileManifestProbeResult, TilePathScheme, TileReadySource, TileSet,
+    TileStreamEvent, decode_fast_rgba_zstd, decode_fast_rgba_zstd_header, encode_fast_rgba_zstd,
+    encode_fast_rgba_zstd_with_validation, tile_cache_validation_value,
 };
+
+pub use bedrock_world::{ChunkBounds, ChunkPos, Dimension, NbtTag};

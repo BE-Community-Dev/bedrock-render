@@ -1,6 +1,6 @@
 [package]
 name = "bedrock-render"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -20,6 +20,7 @@ include = [
     "CONTRIBUTING.md",
     "LICENSE-APACHE",
     "LICENSE-MIT",
+    "build.rs",
     "benches/**/*.rs",
     "data/colors/*.json",
     "docs/**/*.md",
@@ -35,15 +36,19 @@ name = "bedrock_render"
 path = "src/bedrock_render.rs"
 
 [features]
-default = ["async", "webp", "gpu"]
+default = ["async", "webp"]
 async = ["dep:tokio", "bedrock-world/async"]
-gpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+gpu-core = []
+gpu-dx11 = ["gpu-core", "dep:windows"]
+gpu-vulkan = ["gpu-core", "dep:pollster", "dep:wgpu", "wgpu/std", "wgpu/wgsl", "wgpu/vulkan"]
+gpu-dx12 = ["gpu-core", "dep:pollster", "dep:wgpu", "wgpu/std", "wgpu/wgsl", "wgpu/dx12"]
+gpu = ["gpu-dx11", "gpu-vulkan", "gpu-dx12"]
 webp = ["image/webp"]
 png = ["image/png"]
 
 [dependencies]
+bedrock-leveldb = { path = "../bedrock-leveldb" }
 bedrock-world = { path = "../bedrock-world", default-features = true }
-bytemuck = { version = "1.25.0", features = ["derive"], optional = true }
 crossbeam-channel = "0.5.15"
 image = { version = "0.25.6", default-features = false }
 indexmap = "2.12.1"
@@ -54,7 +59,12 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 sysinfo = "0.38.0"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["rt", "sync"], optional = true }
-wgpu = { version = "29.0.1", optional = true }
+wgpu = { version = "29.0.3", default-features = false, optional = true }
+windows = { version = "0.62.2", optional = true, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+zstd = "0.13.3"
+
+[build-dependencies]
+serde_json = { version = "1.0", features = ["preserve_order"] }
 
 [dev-dependencies]
 criterion = "0.5"

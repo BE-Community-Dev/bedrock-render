@@ -1,11 +1,13 @@
 # API Guide
 
-`bedrock-render` exposes four layers:
+`bedrock-render` exposes five layers:
 
 - `RenderPalette` for color lookup, overrides, and JSON imports.
 - `MapRenderer` for tile, batch, region, bake, and web-map rendering.
 - `MapRenderSession` for long-lived interactive renderers with cache reuse and
   streaming tile events.
+- `bedrock_render::editor` for explicit v0.2.0 writable map tooling over
+  `bedrock-world` map/global/HSA/actor/block-entity/heightmap/biome records.
 - Value types for layout, threading, memory budgets, diagnostics, and cached
   tile paths.
 
@@ -17,6 +19,10 @@ Create a lazy `bedrock_world::BedrockWorld`, then pass it with a palette to
 ```rust
 use std::sync::Arc;
 
+let world = bedrock_world::BedrockWorld::open_blocking(
+    "path/to/minecraftWorld",
+    bedrock_world::OpenOptions::default(),
+)?;
 let renderer = bedrock_render::MapRenderer::new(
     Arc::new(world),
     bedrock_render::RenderPalette::default(),
@@ -82,6 +88,42 @@ that prefers an async channel, use `render_web_tiles_streaming_channel`; it
 returns a `tokio::sync::mpsc::Receiver<TileStreamEvent>` immediately and lets
 the render task continue in the background.
 
+## Editor Facade
+
+Rendering remains read-only by default. Use `bedrock_render::editor` only for
+explicit write-mode workflows. The module re-exports the common `bedrock-world`
+v0.2 map/global/HSA/actor/block-entity/heightmap/biome/query/write-guard types
+and adds two render-facing helpers:
+
+- `MapWorldEditor` opens or wraps a writable `BedrockWorld` and exposes common
+  structured editor calls.
+- `MapEditInvalidation` describes which metadata, overlays, chunks, and tile
+  caches must be refreshed after a write.
+
+```rust
+use bedrock_render::editor::{MapWorldEditor, WorldScanOptions};
+
+let editor = MapWorldEditor::open_writable("path/to/minecraftWorld")?;
+let maps = editor.scan_map_records(WorldScanOptions::default())?;
+let overlays = editor.scan_hsa_records(WorldScanOptions::default())?;
+
+let invalidation = editor.put_heightmap(chunk_pos, chunk_version, &heightmap)?;
+if invalidation.refresh_metadata() {
+    // reload metadata panels or manifest-derived summaries
+}
+for chunk in invalidation.affected_chunks() {
+    // remove cached tiles covering this chunk and schedule rerender
+}
+```
+
+`MapWorldEditor` intentionally does not replace the full `bedrock-world` API.
+Use the facade for common map viewer actions such as map/global records, HSA,
+modern actors, block entities, heightmaps, and biome storage. Use
+`editor.world()` or `bedrock-world` directly for uncommon Bedrock records or
+tool-specific validation. Applications should still require a per-operation
+confirmation before mutating methods and should increment UI generations before
+refreshing overlays or tiles so stale background results are ignored.
+
 ### Replacing older entry points
 
 - `render_web_tiles_blocking` remains suitable for static exports where one
@@ -110,7 +152,10 @@ keeps cancellation and progress scoped to its generation.
 ## Render Modes
 
 - `SurfaceBlocks` is the primary terrain map.
-- `HeightMap` renders height gradients from Bedrock height data.
+- `HeightMap` renders height gradients from the computed surface columns used
+  by terrain rendering.
+- `RawHeightMap` renders raw Bedrock Data2D/Data3D/Legacy heightmap records for
+  diagnostics and migration checks.
 - `Biome { y }` renders resolved biome colors at a sampled Y layer.
 - `RawBiomeLayer { y }` renders diagnostic biome-id colors.
 - `LayerBlocks { y }` renders a fixed X/Z block layer.
@@ -118,7 +163,52 @@ keeps cancellation and progress scoped to its generation.
   Y layer.
 
 Missing chunks and empty terrain are transparent. Unknown block names are opaque
-purple diagnostic pixels and are counted in `RenderDiagnostics`.
+diagnostic pixels.
+
+### Canonical Terrain Sampling
+
+`SurfaceBlocks` and `HeightMap` use `bedrock-world` exact surface sampling:
+actual block columns are scanned top-down and baked as a canonical
+`TerrainColumnSample` contract with the visual surface block, relief support,
+thin overlay, and water context. Saved heightmaps are still loaded, but they
+are treated as hints/diagnostics and can disagree with the rendered surface.
+Use `RawHeightMap` when you need the old raw-height diagnostic image.
+
+### Legacy Terrain
+
+Old Bedrock/Pocket Edition chunks may expose only `LegacyTerrain` tag `0x30`.
+`bedrock-render` handles this through `bedrock-world` render exact-batch loading:
+
+- `SurfaceBlocks` scans the legacy `0..=127` height range from actual block IDs.
+- `HeightMap` colors the computed legacy surface height over `0..=127`.
+- `RawHeightMap` colors the saved legacy heightmap over `0..=127`.
+- `LayerBlocks` and `CaveSlice` sample legacy block ID + data arrays directly.
+- Common 0.16 numeric block IDs are mapped to modern `minecraft:*` names before
+  palette lookup; unknown IDs become `legacy:<id>` and are counted by
+  diagnostics.
+- Legacy biome samples are decoded as `[biome_id, red, green, blue]`.
+  `Biome` renders saved RGB directly and prefers it over conflicting old
+  Data2D/Data3D biome ids. `RawBiomeLayer` uses the saved biome ID when the
+  palette knows it and falls back to saved RGB for unknown old IDs.
+- `SurfaceBlocks` uses legacy RGB samples for grass and foliage tint. Water
+  keeps the normal water-tint fallback so legacy grass colors are not applied
+  to water.
+- If a transition chunk has both `LegacyTerrain` and `SubChunkPrefix`, subchunk
+  block data wins and legacy terrain is only a fallback for missing block data.
+
+The renderer cache version is `RENDERER_CACHE_VERSION = 48`, so old
+transparent, incorrectly sampled, raw-height-driven, misplaced region-compose,
+renderer-rescanned, or incorrectly prioritized legacy-biome tiles are not
+reused. `RenderOptions::default()` bypasses tile cache reads/writes; opt in
+with `RenderCachePolicy::Use` when a session or export should use the cache.
+`MapRenderSession::new` also lifts stale lower renderer versions to the current
+version before creating cache keys.
+
+`RenderPipelineStats` exposes placement diagnostics for web/region pipelines:
+`region_chunks_copied`, `region_chunks_out_of_bounds`, and
+`tile_missing_region_samples`. Non-zero out-of-bounds or missing-region sample
+counts indicate a planning/compose contract problem rather than a LevelDB read
+failure.
 
 ## Error Handling
 
@@ -142,15 +232,22 @@ Display strings are for humans and may become more descriptive over time.
 
 ## GPU Backend
 
-The default feature set includes `gpu`. `RenderBackend::Auto` uses CPU by default
-unless `BEDROCK_RENDER_GPU` requests GPU, or unless callers explicitly set
-`RenderBackend::Gpu`. GPU failures are reported through
-`RenderPipelineStats::gpu_fallback_reason` and counted as CPU fallback renders.
+The default feature set includes `gpu`. `RenderBackend::Auto` now attempts GPU
+compose for tiles at or above `RenderGpuOptions::min_pixels`, then falls back to
+CPU when the GPU feature, adapter, tile shape, or shader path is unavailable.
+`RenderBackend::Gpu` forces the attempt. `RenderGpuFallbackPolicy::Required`
+turns these fallback cases into errors instead of CPU renders. GPU failures are
+reported through `RenderPipelineStats::gpu_fallback_reason` and counted as CPU
+fallback renders.
 
 `RenderOptions::gpu` controls scheduling:
 
 - `min_pixels` is the Auto-mode threshold before GPU compose is attempted.
-- `max_in_flight=0` uses profile defaults: up to 2 interactive jobs or 4 export
+- `backend` selects `auto` or the `wgpu` backend.
+- `fallback_policy` selects CPU fallback or strict required GPU execution.
+- `diagnostics` selects off, summary, or verbose GPU logs through the `log`
+  facade.
+- `max_in_flight=0` uses profile defaults: up to 4 interactive jobs or 8 export
   jobs.
 - `batch_size=0`, `batch_pixels=0`, `submit_workers=0`, and
   `readback_workers=0` use profile-aware automatic defaults.
@@ -159,11 +256,24 @@ unless `BEDROCK_RENDER_GPU` requests GPU, or unless callers explicitly set
 
 The GPU path uses a single `wgpu` device with a bounded in-flight queue. CPU
 workers continue to load, bake, and prepare tiles while GPU jobs upload,
-dispatch, and read back results. Stats expose `gpu_batches`,
-`gpu_batch_tiles`, `gpu_max_in_flight`, `gpu_queue_wait_ms`,
-`gpu_submit_workers`, `gpu_worker_threads`, `gpu_buffer_reuses`,
+dispatch, and read back results. Web/region ready tiles are submitted through a
+true batch path, so `batch_size` and `batch_pixels` affect submit/readback
+counts. Stats expose selected backend, adapter name/vendor/device type,
+`gpu_supported_tiles`, `gpu_skipped_tiles`, `gpu_skip_reason`, `gpu_batches`,
+`gpu_batch_tiles`, `gpu_submit_batches`, `gpu_readback_batches`,
+`gpu_uploaded_bytes`, `gpu_readback_bytes`, `gpu_prepare_ms`, `gpu_max_in_flight`,
+`gpu_queue_wait_ms`, `gpu_submit_workers`, `gpu_worker_threads`, `gpu_buffer_reuses`,
 `gpu_buffer_allocations`, `gpu_staging_reuses`, and
-`gpu_staging_allocations` for tuning.
+`gpu_staging_allocations` for tuning. CPU feeding diagnostics are split into
+`world_load_ms`, `db_read_ms`, `decode_ms`, `region_copy_ms`, and
+`world_worker_threads`, which helps distinguish a slow shader from an idle GPU
+waiting for LevelDB/decode/bake work.
+
+Environment overrides remain supported:
+
+- `BEDROCK_RENDER_GPU=auto|on|off|required`
+- `BEDROCK_RENDER_GPU_BACKEND=auto|wgpu`
+- `BEDROCK_RENDER_GPU_LOG=off|summary|verbose`
 
 `SurfaceRenderOptions::block_boundaries` controls the default top-down 2D block
 outline and height-contact shadow. It is part of the render cache signature and
@@ -171,6 +281,7 @@ is disabled when `height_shading` is disabled.
 
 Streaming complete events include `RenderPipelineStats`, so UI status bars can
 show `resolved_backend`, `gpu_fallback_reason`, cache hits/misses, worker count,
-and CPU/GPU timing without waiting for a separate export summary.
+world/decode worker count, GPU batch/readback counts, and CPU/GPU timing without
+waiting for a separate export summary.
 
 CPU-only consumers can disable default features and enable the formats they need.

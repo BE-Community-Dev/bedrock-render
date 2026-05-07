@@ -29,9 +29,17 @@ formats they need.
 - Web-map export uses a global chunk-bake queue, per-wave dynamic memory budget,
   parallel tile compose/encode, and a bounded MPMC writer queue so CPU workers
   are not serialized behind `fs::write`.
+- Region/web tile rendering uses one shared chunk-to-region coordinate helper
+  for direct tiles, shared bakes, streaming sessions, and GPU preparation. Trace
+  logs report copied/out-of-bounds region chunks and missing region samples so
+  chunk-level placement bugs can be separated from parser data issues.
 - Interactive frontends should create one `MapRenderSession` per opened world.
   A session holds the renderer, tile cache, and diagnostics context so panning
   and zooming do not reopen the world or rebuild cache state for every batch.
+- Editing is explicit. Use `bedrock_render::editor::MapWorldEditor` only after
+  the user has entered write mode; normal render sources remain read-only.
+  Mutating editor calls return `MapEditInvalidation` so frontends can refresh
+  metadata, overlays, affected chunks, and tile caches deterministically.
 - `RenderMemoryBudget::Auto` uses a bounded cache budget for chunk bakes and
   export waves. `FixedBytes` and `Disabled` are available for offline tooling.
 - Long operations support explicit cancellation and progress callbacks.
@@ -41,22 +49,48 @@ formats they need.
 - `RenderMode::Biome { y }`: biome color map sampled at the requested Y layer.
 - `RenderMode::RawBiomeLayer { y }`: diagnostic biome-id color map.
 - `RenderMode::LayerBlocks { y }`: fixed block layer map at world Y.
-- `RenderMode::SurfaceBlocks`: main top-down terrain map. Each X/Z column starts
-  from the Bedrock height map, scans down to the highest renderable block, applies
-  biome tint, and blends transparent water over the solid block below.
-- `RenderMode::HeightMap`: height gradient from Bedrock Data2D/Data3D records.
+- `RenderMode::SurfaceBlocks`: main top-down terrain map. Each X/Z column is
+  sampled from actual loaded blocks, not raw Data2D/Data3D/Legacy heightmap
+  values. It applies biome tint, blends thin overlays, and blends transparent
+  water over the solid block below.
+- `RenderMode::HeightMap`: height gradient from the same computed surface
+  columns used by terrain rendering.
+- `RenderMode::RawHeightMap`: diagnostic height gradient from raw Bedrock
+  Data2D/Data3D/Legacy heightmap records.
 - `RenderMode::CaveSlice { y }`: fixed Y cave diagnostic map for air/solid/water/lava.
 
-`SurfaceBlocks` follows the same core data flow used by BedrockMap's terrain
-bake path: use `chunk.get_height(x,z)`, scan downward in that column until a
-renderable block is found, then bake terrain/biome/height data. The default
-terrain preview applies lightweight height-normal shading so slopes remain visible;
-the height map remains a separate diagnostic image. Missing chunk or
-missing height records are treated as absent terrain, not as gray map pixels.
-Fixed Y rendering remains available through `LayerBlocks { y }`.
+`SurfaceBlocks` and the default `HeightMap` no longer trust saved heightmaps as
+the rendering fact. `bedrock-world` computes canonical visual column samples by
+top-down scanning modern paletted subchunks, legacy subchunks, or
+`LegacyTerrain`; the renderer then only bakes colors, computed heights, relief
+heights, and water depths from that single contract. Raw height records remain
+available through `RawHeightMap` for diagnostics. Missing chunks or empty
+terrain are transparent, not gray map pixels. Fixed Y rendering remains
+available through `LayerBlocks { y }`.
 Unknown blocks are rendered as opaque purple diagnostic pixels. Missing chunks,
 missing height maps, and empty terrain are transparent and counted separately in
 `RenderDiagnostics`.
+
+Old Bedrock/Pocket Edition worlds are supported through
+`bedrock-world::RenderChunkData::legacy_terrain` and
+structured `legacy_biomes`. For pure `LegacyTerrain` chunks, `SurfaceBlocks` and
+`HeightMap` use the fixed `0..=127` height range, while `LayerBlocks` and
+`CaveSlice` sample legacy numeric block IDs directly. Common 0.16 numeric IDs
+are mapped to modern `minecraft:*` names; unknown IDs render through the normal
+unknown-block diagnostic path. If a transition chunk contains both
+`LegacyTerrain` and `SubChunkPrefix`, subchunk block data is preferred and
+legacy terrain is used only as a fallback. Legacy biome RGB values take
+priority over old Data2D/Data3D biome IDs and drive
+`Biome` output and grass/foliage tint; `RawBiomeLayer` uses the saved biome ID
+when the palette knows it and falls back to saved RGB for unknown old IDs.
+Real legacy payloads are decoded as `[biome_id, red, green, blue]`, while
+`legacy_biome_colors` remains only a compatibility `0x00RRGGBB` view. Water
+keeps the normal water-tint path and does not use legacy grass RGB.
+
+Renderer cache version `48` invalidates tiles created before the single
+canonical visual surface sampler. `RenderOptions::default()` now bypasses the
+tile cache; set `cache_policy: RenderCachePolicy::Use` explicitly for session
+or export paths that should read/write cached images.
 
 ## API Sketch
 
@@ -88,6 +122,38 @@ let tiles = renderer.render_region_tiles_blocking(
     },
 )?;
 ```
+
+For examples and tools, prefer `bedrock_world::BedrockWorld::open_blocking` or
+`BedrockWorld::open` instead of constructing a LevelDB storage handle directly.
+That enables automatic detection of old LevelDB `LegacyTerrain` worlds and
+read-only `chunks.dat` worlds.
+
+## Editing Facade
+
+`bedrock_render::editor` is the v0.2.0 writable boundary for map viewers and
+tooling. It re-exports the common `bedrock-world` map/global/HSA/actor/block
+entity/heightmap/biome types and wraps them in a small render-aware facade.
+Use it for common map editor actions; call `bedrock-world` directly when a tool
+needs lower-level Bedrock records or custom validation.
+
+```rust
+use bedrock_render::editor::{MapWorldEditor, WorldScanOptions};
+
+let editor = MapWorldEditor::open_writable("path/to/minecraftWorld")?;
+let hsa = editor.scan_hsa_records(WorldScanOptions::default())?;
+
+let invalidation = editor.delete_hsa_for_chunk(chunk_pos)?;
+if invalidation.refresh_overlays() {
+    // reload overlays for the current viewport
+}
+if invalidation.clear_tile_cache() {
+    // discard cached tiles covering invalidation.affected_chunks()
+}
+```
+
+Write paths should still be guarded by an application-level confirmation step.
+After a successful edit, increment UI generations before scheduling overlay or
+tile reload work so stale background results cannot repaint the old state.
 
 ## Streaming Session API
 
@@ -198,7 +264,7 @@ cargo run --example render_streaming_session -- <world_path>
 
 ## Preview Tool
 
-The preview example generates six atlas PNGs plus web-map tile folders:
+The preview example generates seven atlas PNGs plus web-map tile folders:
 
 ```text
 cargo run --example render_preview --features png
@@ -220,8 +286,9 @@ Preview output layout:
   layer-y64-viewport.png
   surface-viewport.png
   heightmap-viewport.png
+  raw-heightmap-viewport.png
   cave-y32-viewport.png
-  web-tiles/sample/signature/r2-p1/overworld/heightmap/16c-1bpp/21/12.png
+  web-tiles/sample/signature/r2-p1/overworld/heightmap/16c-1bpp/25/12.png
 ```
 
 ## Web Map Export
@@ -403,19 +470,22 @@ Fixed world-Y block layer rendered as an X/Z plane. This is not a side section.
 
 ### `SurfaceBlocks`
 
-Primary top-down terrain map. Each X/Z column uses the chunk height map, scans
-down to the highest renderable block, applies biome tint, and blends transparent
-water with the block below. Lightweight height-normal shading is enabled by default
-so terrain does not look completely flat. `SurfaceRenderOptions::block_boundaries`
-adds a subtle 2D per-block outline and height-contact shadow so cliffs, paths,
-and same-color blocks remain readable without switching to a 2.5D view. Use
-`HeightMap` for elevation analysis.
+Primary top-down terrain map. Each X/Z column is sampled from the real loaded
+block data top-down, applies biome tint, and blends transparent water with the
+block below. Lightweight height-normal shading is enabled by default so terrain
+does not look completely flat. `SurfaceRenderOptions::block_boundaries` adds a
+subtle 2D per-block outline and height-contact shadow so cliffs, paths, and
+same-color blocks remain readable without switching to a 2.5D view. Use
+`HeightMap` for computed surface elevation and `RawHeightMap` for saved raw
+heightmap diagnostics.
 
 ![Surface block map](docs/images/surface-viewport.png)
 
 ### `HeightMap`
 
-Height gradient derived from Bedrock Data2D/Data3D height records.
+Height gradient derived from the same computed surface column used by
+`SurfaceBlocks`. Raw Data2D/Data3D/Legacy heightmap records are available through
+`RawHeightMap` when you need to debug saved height hints.
 
 ![Height map](docs/images/heightmap-viewport.png)
 
@@ -427,13 +497,18 @@ Fixed Y cave diagnostic map for air, solid blocks, water, and lava.
 
 ## Performance Model
 
-- `Biome`, `RawBiomeLayer`, `LayerBlocks`, `HeightMap`, and `CaveSlice` prefetch
-  only the chunk records needed by the tile.
-- Height data is fetched once per chunk through `bedrock-world` and cached as a
-  compact `16x16` height array inside the tile context.
-- `SurfaceBlocks` does not scan missing-height columns from world top to bottom.
-  Missing chunk/height data is counted in diagnostics and emitted as absent
-  terrain.
+- `MapRenderer<S = Arc<dyn WorldStorage>>` supports both the compatibility
+  dynamic storage path and typed storage such as
+  `MapRenderer<BedrockLevelDbStorage>`. Tools that own the backend should prefer
+  typed storage to remove dynamic dispatch from renderer/world hot paths.
+- `Biome`, `RawBiomeLayer`, `RawHeightMap`, `LayerBlocks`, and `CaveSlice`
+  prefetch only the chunk records needed by the tile.
+- `SurfaceBlocks` and `HeightMap` load the relevant subchunks and compute a
+  canonical `16x16` surface column grid from actual blocks. Raw height mismatches
+  are kept in diagnostics so bad saved height hints can be isolated without
+  corrupting the rendered map.
+- Missing chunks or columns with no real surface block are counted in diagnostics
+  and emitted as absent terrain.
 - Subchunk access uses `SubChunk::block_state_at(local_x, local_y, local_z)` so
   renderer code does not duplicate palette index math.
 - Web export uses a region-first bake pipeline. `--chunks-per-region` controls
@@ -443,9 +518,13 @@ Fixed Y cave diagnostic map for air, solid blocks, water, and lava.
   The renderer splits baking, composition, and writing into waves bounded by
   `--memory-budget`. `--pipeline-depth` and `--write-queue-capacity` only bound
   encoded tiles waiting for disk writes.
-- `SurfaceBlocks` uses chunk bake: each chunk is reduced to a `16x16` terrain
-  image first, then region planes and WebP tiles are assembled from baked chunk
-  pixels.
+- `SurfaceBlocks` uses chunk bake: each chunk is reduced from
+  `bedrock-world` column samples to a `16x16` terrain image first, then region
+  planes and WebP tiles are assembled from baked chunk pixels.
+- Single-tile bake rendering uses `bedrock-world` exact batch loading for all
+  chunks covered by the tile. The benchmark report should show
+  `prefix_scans=0` and one `exact_get_batches` entry for the sampled surface
+  region, keeping repeated point lookups out of the render loop.
 - The static viewer uses `RenderLayout` auto-scaling. Small worlds default to
   full detail; larger worlds can use 2/4/8 blocks per pixel without changing the
   visible tile coverage.
@@ -454,16 +533,24 @@ Fixed Y cave diagnostic map for air, solid blocks, water, and lava.
   stale cached tiles are rejected by the UI and regenerated.
 - `ImageFormat::Rgba` is the lowest-latency UI path. WebP/PNG are intended for
   cache/export/preview paths.
-- `RenderOptions::gpu` controls GPU compose scheduling. `max_in_flight=0`,
-  `batch_size=0`, `batch_pixels=0`, `submit_workers=0`, `readback_workers=0`,
-  `buffer_pool_bytes=0`, and `staging_pool_bytes=0` use profile-aware defaults;
-  export workloads allow more in-flight GPU work than interactive workloads.
+- `RenderOptions::gpu` controls GPU backend, fallback policy, diagnostics, and
+  compose scheduling. `max_in_flight=0`, `batch_size=0`, `batch_pixels=0`,
+  `submit_workers=0`, `readback_workers=0`, `buffer_pool_bytes=0`, and
+  `staging_pool_bytes=0` use profile-aware defaults; export workloads allow
+  larger GPU batches than interactive workloads.
 - `RenderOptions::cpu` controls bounded CPU queue depth and chunk batch sizing,
   while `RenderOptions::priority` lets interactive sessions render the current
   viewport center before distant tiles.
 - GPU compose runs with bounded concurrent in-flight jobs on one `wgpu` device.
-  Failed GPU tiles fall back to CPU and report `gpu_fallback_reason`; stats also
-  expose GPU batch tiles, submit/readback workers, and buffer/staging pool reuse.
+  Direct tiles, shared-bake tiles, web map tiles, and streaming sessions all use
+  the same GPU decision path. Interactive sessions now group multiple cache
+  misses by default while still streaming ready tiles as soon as they finish.
+  Web/region ready tiles submit through true batches, so `batch_size` and
+  `batch_pixels` affect submit/readback counts. Failed GPU tiles fall back to CPU
+  unless `RenderGpuFallbackPolicy::Required` is set; stats expose backend/adapter
+  identity, supported/skipped/fallback counts, world load/decode timing, region
+  copy timing, GPU prepare/upload/dispatch/readback timing, batch submit/readback
+  counts, uploaded/readback bytes, and buffer/staging pool reuse.
 - The static web-map example writes WebP tiles under
   `tiles/<dimension>/<mode>/<layout>/<tile_z>/<tile_x>.webp`; it does not leave
   gaps between tiles and uses transparent pixels for absent world data.
@@ -483,8 +570,9 @@ cargo rustdoc --lib --all-features -- -D missing_docs
 cargo bench --bench render --all-features
 ```
 
-The default benchmark suite measures tile rendering, chunk baking, and small
-batch behavior. Full web-map export benchmarks are opt-in:
+The default benchmark suite measures tile rendering, chunk baking, small batch
+behavior, and v0.2.0 editor facade scans. Full web-map export benchmarks are
+opt-in:
 
 ```text
 $env:BEDROCK_RENDER_FULL_BENCH='1'
@@ -497,7 +585,4 @@ and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Current Limits
 
-- Surface rendering is top-down and BedrockMap-style. Web-map export now uses a
-  global chunk-bake queue and bounded GPU compose queue, but cross-process
-  persistent chunk-bake reuse is still a future optimization.
 - V1 does not implement entity markers or labels.

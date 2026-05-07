@@ -1,9 +1,10 @@
 use bedrock_render::{
     ChunkRegion, ImageFormat, MapRenderSession, MapRenderSessionConfig, MapRenderer,
     RenderCachePolicy, RenderCancelFlag, RenderExecutionProfile, RenderLayout, RenderMode,
-    RenderOptions, RenderPalette, RenderThreadingOptions, RenderTilePriority, TileStreamEvent,
+    RenderOptions, RenderPalette, RenderThreadingOptions, RenderTilePriority, TileReadySource,
+    TileStreamEvent,
 };
-use bedrock_world::{BedrockLevelDbStorage, BedrockWorld, Dimension, OpenOptions};
+use bedrock_world::{BedrockWorld, Dimension, OpenOptions};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -11,8 +12,11 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod common;
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    common::init_logger();
     let world_path = std::env::args_os().nth(1).map_or_else(
         || {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -25,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from,
     );
 
-    if !world_path.join("db").join("CURRENT").exists() {
+    if !world_path.join("db").join("CURRENT").exists() && !world_path.join("chunks.dat").exists() {
         println!(
             "missing fixture world; pass a Bedrock world path as the first argument: {}",
             world_path.display()
@@ -33,14 +37,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let storage = Arc::new(BedrockLevelDbStorage::open_read_only(
-        world_path.join("db"),
-    )?);
-    let world = Arc::new(BedrockWorld::from_storage(
+    let world = Arc::new(BedrockWorld::open_blocking(
         &world_path,
-        storage,
         OpenOptions::default(),
-    ));
+    )?);
     let renderer = MapRenderer::new(world, RenderPalette::default());
     let session = MapRenderSession::new(
         renderer,
@@ -58,11 +58,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         blocks_per_pixel: 4,
         pixels_per_block: 1,
     };
-    let planned_tiles = MapRenderer::plan_region_tiles(
-        ChunkRegion::new(Dimension::Overworld, 0, 0, 31, 31),
-        RenderMode::SurfaceBlocks,
-        layout,
-    )?;
+    let planned_tiles =
+        MapRenderer::<std::sync::Arc<dyn bedrock_world::WorldStorage>>::plan_region_tiles(
+            ChunkRegion::new(Dimension::Overworld, 0, 0, 31, 31),
+            RenderMode::SurfaceBlocks,
+            layout,
+        )?;
     let rendered_tiles = Arc::new(AtomicUsize::new(0));
     let cached = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
@@ -86,19 +87,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let failed = Arc::clone(&failed);
             move |event| {
                 match event {
-                    TileStreamEvent::Cached { planned, encoded } => {
-                        cached.fetch_add(1, Ordering::Relaxed);
+                    TileStreamEvent::Ready {
+                        planned,
+                        tile,
+                        source,
+                    } => {
+                        match source {
+                            TileReadySource::MemoryCache
+                            | TileReadySource::DiskCacheFresh
+                            | TileReadySource::DiskCacheStale
+                            | TileReadySource::DiskCacheOptimistic => {
+                                cached.fetch_add(1, Ordering::Relaxed);
+                            }
+                            TileReadySource::Render => {
+                                rendered_tiles.fetch_add(1, Ordering::Relaxed);
+                            }
+                            TileReadySource::Preview => {}
+                        }
                         println!(
-                            "cached tile ({}, {}) bytes={}",
-                            planned.job.coord.x,
-                            planned.job.coord.z,
-                            encoded.len()
-                        );
-                    }
-                    TileStreamEvent::Rendered { planned, tile } => {
-                        rendered_tiles.fetch_add(1, Ordering::Relaxed);
-                        println!(
-                            "rendered tile ({}, {}) pixels={}",
+                            "{:?} tile ({}, {}) pixels={}",
+                            source,
                             planned.job.coord.x,
                             planned.job.coord.z,
                             tile.rgba.len() / 4
@@ -117,14 +125,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             progress.completed_tiles, progress.total_tiles
                         );
                     }
+                    TileStreamEvent::CacheValidation { planned, outcome } => {
+                        println!(
+                            "cache validation {:?} tile ({}, {})",
+                            outcome, planned.job.coord.x, planned.job.coord.z
+                        );
+                    }
                     TileStreamEvent::Complete { diagnostics, stats } => {
                         println!(
-                            "complete planned={} cache={}/{} gpu={:?} fallback={:?} missing_chunks={}",
+                            "complete planned={} cache={}/{} backend={} cpu_tiles={} missing_chunks={}",
                             stats.planned_tiles,
                             stats.cache_hits,
                             stats.cache_misses,
-                            stats.resolved_backend,
-                            stats.gpu_fallback_reason,
+                            stats.resolved_backend.label(),
+                            stats.cpu_tiles,
                             diagnostics.missing_chunks
                         );
                     }

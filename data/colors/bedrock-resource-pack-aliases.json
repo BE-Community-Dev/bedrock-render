@@ -78,6 +78,7 @@
     "minecraft:stripped_spruce_wood": "textures/blocks/stripped_spruce_log",
     "minecraft:sunflower": "textures/blocks/double_plant_sunflower_top",
     "minecraft:tall_grass": "textures/blocks/double_plant_grass_top",
+    "minecraft:terracotta": "hardened_clay",
     "minecraft:vine": "textures/blocks/vine_carried",
     "minecraft:warped_planks": "warped_planks",
     "minecraft:white_tulip": "textures/blocks/flower_tulip_white"

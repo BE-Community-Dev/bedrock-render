@@ -1,14 +1,13 @@
 use bedrock_render::{
-    BlockBoundaryRenderOptions, ChunkRegion, DEFAULT_PALETTE_VERSION, GPU_COMPOSE_SHADER_VERSION,
-    ImageFormat, MapRenderer, PlannedTile, RENDERER_CACHE_VERSION, RegionLayout, RenderBackend,
-    RenderDiagnostics, RenderDiagnosticsSink, RenderExecutionProfile, RenderGpuOptions, RenderJob,
-    RenderLayout, RenderMemoryBudget, RenderMode, RenderOptions, RenderPalette,
-    RenderPipelineStats, RenderThreadingOptions, SurfaceRenderOptions, TerrainLightingOptions,
-    TerrainLightingPreset, TileCoord,
+    BlockBoundaryRenderOptions, ChunkRegion, DEFAULT_PALETTE_VERSION, ImageFormat, MapRenderer,
+    PlannedTile, RENDERER_CACHE_VERSION, RegionLayout, RenderBackend, RenderDiagnostics,
+    RenderDiagnosticsSink, RenderExecutionProfile, RenderJob, RenderLayout, RenderMemoryBudget,
+    RenderMode, RenderOptions, RenderPalette, RenderPipelineStats, RenderThreadingOptions,
+    SurfaceRenderOptions, TerrainLightingOptions, TerrainLightingPreset, TileCoord,
 };
 use bedrock_world::{
-    BedrockLevelDbStorage, BedrockWorld, ChunkBounds, ChunkPos, Dimension, OpenOptions,
-    WorldScanOptions, WorldThreadingOptions,
+    BedrockWorld, ChunkBounds, ChunkPos, Dimension, OpenOptions, WorldScanOptions,
+    WorldThreadingOptions,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -23,9 +22,12 @@ use std::sync::{
 };
 use std::thread;
 
+mod common;
+
 // This example keeps setup, layout discovery, and rendering orchestration visible in one entrypoint.
 #[allow(clippy::too_many_lines)]
 fn main() -> bedrock_render::Result<()> {
+    common::init_logger();
     let mut config = WebMapConfig::parse()?;
     if config.output_dir.exists() && config.force {
         fs::remove_dir_all(&config.output_dir).map_err(|error| {
@@ -82,15 +84,10 @@ fn main() -> bedrock_render::Result<()> {
         config.output_dir.join("viewer.html").display()
     );
 
-    let storage = Arc::new(
-        BedrockLevelDbStorage::open(config.world_path.join("db"))
+    let world = Arc::new(
+        BedrockWorld::open_blocking(config.world_path.clone(), OpenOptions::default())
             .map_err(bedrock_render::BedrockRenderError::World)?,
     );
-    let world = Arc::new(BedrockWorld::from_storage(
-        config.world_path.clone(),
-        storage,
-        OpenOptions::default(),
-    ));
     let renderer = MapRenderer::new(Arc::clone(&world), palette);
     let discovered_dimensions = discover_dimension_tiles(world.as_ref(), &config)?;
 
@@ -135,7 +132,6 @@ struct WebMapConfig {
     layout: RenderLayout,
     region_layout: RegionLayout,
     surface_options: SurfaceRenderOptions,
-    gpu_options: RenderGpuOptions,
     region: Option<(i32, i32, i32, i32)>,
     threading: RenderThreadingOptions,
     backend: RenderBackend,
@@ -181,10 +177,9 @@ impl WebMapConfig {
         let mut tile_size_pixels = None;
         let mut terrain_lighting = TerrainLightingOptions::default();
         let mut block_boundaries = BlockBoundaryRenderOptions::default();
-        let mut gpu_options = RenderGpuOptions::default();
         let mut region = None;
         let mut threading = RenderThreadingOptions::Auto;
-        let mut backend = RenderBackend::Auto;
+        let backend = RenderBackend::Cpu;
         let mut profile = RenderExecutionProfile::Export;
         let mut memory_budget = RenderMemoryBudget::Auto;
         let mut pipeline_depth = 0_usize;
@@ -405,57 +400,6 @@ impl WebMapConfig {
                 "--threads" => {
                     threading = parse_threads(&next_arg(&args, &mut index, "--threads")?)?;
                 }
-                "--gpu" => {
-                    backend = parse_backend(&next_arg(&args, &mut index, "--gpu")?)?;
-                }
-                "--gpu-min-pixels" => {
-                    gpu_options.min_pixels = parse_positive_usize(
-                        &next_arg(&args, &mut index, "--gpu-min-pixels")?,
-                        "--gpu-min-pixels",
-                    )?;
-                }
-                "--gpu-max-in-flight" => {
-                    gpu_options.max_in_flight = parse_nonnegative_usize(
-                        &next_arg(&args, &mut index, "--gpu-max-in-flight")?,
-                        "--gpu-max-in-flight",
-                    )?;
-                }
-                "--gpu-batch-size" => {
-                    gpu_options.batch_size = parse_nonnegative_usize(
-                        &next_arg(&args, &mut index, "--gpu-batch-size")?,
-                        "--gpu-batch-size",
-                    )?;
-                }
-                "--gpu-batch-pixels" => {
-                    gpu_options.batch_pixels = parse_nonnegative_usize(
-                        &next_arg(&args, &mut index, "--gpu-batch-pixels")?,
-                        "--gpu-batch-pixels",
-                    )?;
-                }
-                "--gpu-submit-workers" => {
-                    gpu_options.submit_workers = parse_nonnegative_usize(
-                        &next_arg(&args, &mut index, "--gpu-submit-workers")?,
-                        "--gpu-submit-workers",
-                    )?;
-                }
-                "--gpu-readback-workers" => {
-                    gpu_options.readback_workers = parse_nonnegative_usize(
-                        &next_arg(&args, &mut index, "--gpu-readback-workers")?,
-                        "--gpu-readback-workers",
-                    )?;
-                }
-                "--gpu-buffer-pool-bytes" => {
-                    gpu_options.buffer_pool_bytes = parse_nonnegative_usize(
-                        &next_arg(&args, &mut index, "--gpu-buffer-pool-bytes")?,
-                        "--gpu-buffer-pool-bytes",
-                    )?;
-                }
-                "--gpu-staging-pool-bytes" => {
-                    gpu_options.staging_pool_bytes = parse_nonnegative_usize(
-                        &next_arg(&args, &mut index, "--gpu-staging-pool-bytes")?,
-                        "--gpu-staging-pool-bytes",
-                    )?;
-                }
                 "--profile" => {
                     profile = parse_profile(&next_arg(&args, &mut index, "--profile")?)?;
                 }
@@ -573,10 +517,13 @@ impl WebMapConfig {
             index += 1;
         }
 
-        if !world_path.join("db").join("CURRENT").exists() {
+        if !world_path.join("db").join("CURRENT").exists()
+            && !world_path.join("chunks.dat").exists()
+        {
             return Err(bedrock_render::BedrockRenderError::Validation(format!(
-                "world db CURRENT not found: {}",
-                world_path.join("db").join("CURRENT").display()
+                "world storage not found: expected {} or {}",
+                world_path.join("db").join("CURRENT").display(),
+                world_path.join("chunks.dat").display()
             )));
         }
         let pixels_per_block = resolve_pixels_per_block(
@@ -640,7 +587,6 @@ impl WebMapConfig {
             layout,
             region_layout,
             surface_options,
-            gpu_options,
             region,
             threading,
             backend,
@@ -671,6 +617,7 @@ impl WebMapConfig {
 enum WebRenderMode {
     Surface,
     HeightMap,
+    RawHeightMap,
     Biome,
     Layer,
     Cave,
@@ -681,6 +628,7 @@ impl WebRenderMode {
         match self {
             Self::Surface => RenderMode::SurfaceBlocks,
             Self::HeightMap => RenderMode::HeightMap,
+            Self::RawHeightMap => RenderMode::RawHeightMap,
             Self::Biome => RenderMode::Biome { y: y_layer },
             Self::Layer => RenderMode::LayerBlocks { y: y_layer },
             Self::Cave => RenderMode::CaveSlice { y: cave_y },
@@ -1066,7 +1014,6 @@ fn render_dimension_mode(
             RenderOptions {
                 format: ImageFormat::WebP,
                 backend: config.backend,
-                gpu: config.gpu_options,
                 threading: threading_for_threads(resolved_threads),
                 execution_profile: config.profile,
                 memory_budget: config.memory_budget,
@@ -1205,7 +1152,7 @@ fn format_unknown_blocks(diagnostics: &RenderDiagnostics, limit: usize) -> Strin
 
 fn print_pipeline_stats(dimension: Dimension, mode: RenderMode, stats: &RenderPipelineStats) {
     println!(
-        "{} {} stats planned_tiles={} planned_regions={} unique_chunks={} baked_chunks={} baked_regions={} cache_hits={} cache_misses={} region_hits={} region_misses={} bake_ms={} region_bake_ms={} tile_compose_ms={} encode_ms={} write_ms={} idle_ms={} queue_wait_ms={} cpu_queue_wait_ms={} peak_cache_bytes={} active_tasks_peak={} peak_worker_threads={} backend={} gpu_tiles={} cpu_tiles={} gpu_fallbacks={} gpu_upload_ms={} gpu_dispatch_ms={} gpu_readback_ms={} gpu_batches={} gpu_batch_tiles={} gpu_max_in_flight={} gpu_queue_wait_ms={} gpu_worker_threads={} gpu_submit_workers={} gpu_buffer_reuses={} gpu_buffer_allocations={} gpu_staging_reuses={} gpu_staging_allocations={} gpu_adapter={} gpu_fallback_reason={}",
+        "{} {} stats planned_tiles={} planned_regions={} unique_chunks={} baked_chunks={} baked_regions={} region_chunks_copied={} region_chunks_out_of_bounds={} tile_missing_region_samples={} cache_hits={} cache_misses={} region_hits={} region_misses={} bake_ms={} world_load_ms={} region_bake_ms={} region_copy_ms={} tile_compose_ms={} encode_ms={} write_ms={} idle_ms={} queue_wait_ms={} cpu_queue_wait_ms={} db_read_ms={} decode_ms={} peak_cache_bytes={} active_tasks_peak={} peak_worker_threads={} world_worker_threads={} backend={} cpu_tiles={}",
         dimension_slug(dimension),
         mode_slug(mode),
         stats.planned_tiles,
@@ -1213,40 +1160,31 @@ fn print_pipeline_stats(dimension: Dimension, mode: RenderMode, stats: &RenderPi
         stats.unique_chunks,
         stats.baked_chunks,
         stats.baked_regions,
+        stats.region_chunks_copied,
+        stats.region_chunks_out_of_bounds,
+        stats.tile_missing_region_samples,
         stats.cache_hits,
         stats.cache_misses,
         stats.region_cache_hits,
         stats.region_cache_misses,
         stats.bake_ms,
+        stats.world_load_ms,
         stats.region_bake_ms,
+        stats.region_copy_ms,
         stats.tile_compose_ms,
         stats.encode_ms,
         stats.write_ms,
         stats.worker_idle_ms,
         stats.queue_wait_ms,
         stats.cpu_queue_wait_ms,
+        stats.db_read_ms,
+        stats.decode_ms,
         stats.peak_cache_bytes,
         stats.active_tasks_peak,
         stats.peak_worker_threads,
+        stats.world_worker_threads,
         stats.resolved_backend.label(),
-        stats.gpu_tiles,
-        stats.cpu_tiles,
-        stats.gpu_fallbacks,
-        stats.gpu_upload_ms,
-        stats.gpu_dispatch_ms,
-        stats.gpu_readback_ms,
-        stats.gpu_batches,
-        stats.gpu_batch_tiles,
-        stats.gpu_max_in_flight,
-        stats.gpu_queue_wait_ms,
-        stats.gpu_worker_threads,
-        stats.gpu_submit_workers,
-        stats.gpu_buffer_reuses,
-        stats.gpu_buffer_allocations,
-        stats.gpu_staging_reuses,
-        stats.gpu_staging_allocations,
-        stats.gpu_adapter_name.as_deref().unwrap_or("none"),
-        stats.gpu_fallback_reason.as_deref().unwrap_or("none")
+        stats.cpu_tiles
     );
 }
 
@@ -1560,7 +1498,7 @@ fn write_map_layout(
             json.push_str("        {");
             let _ = write!(
                 json,
-                "\"id\":\"{}\",\"label\":\"{}\",\"tiles\":{},\"rendered\":{},\"missingChunks\":{},\"transparentPixels\":{},\"unknownBlocks\":{},\"plannedRegions\":{},\"uniqueChunks\":{},\"bakedChunks\":{},\"bakedRegions\":{},\"regionBakeMs\":{},\"tileComposeMs\":{},\"bakeMs\":{},\"encodeMs\":{},\"peakCacheBytes\":{},\"activeTasksPeak\":{},\"peakWorkerThreads\":{},\"backend\":\"{}\",\"gpuTiles\":{},\"cpuTiles\":{},\"gpuFallbacks\":{},\"gpuBatches\":{},\"gpuBatchTiles\":{},\"gpuMaxInFlight\":{},\"gpuQueueWaitMs\":{},\"gpuWorkerThreads\":{},\"gpuSubmitWorkers\":{},\"gpuBufferReuses\":{},\"gpuBufferAllocations\":{},\"gpuStagingReuses\":{},\"gpuStagingAllocations\":{}",
+                "\"id\":\"{}\",\"label\":\"{}\",\"tiles\":{},\"rendered\":{},\"missingChunks\":{},\"transparentPixels\":{},\"unknownBlocks\":{},\"plannedRegions\":{},\"uniqueChunks\":{},\"bakedChunks\":{},\"bakedRegions\":{},\"regionChunksCopied\":{},\"regionChunksOutOfBounds\":{},\"tileMissingRegionSamples\":{},\"worldLoadMs\":{},\"regionBakeMs\":{},\"regionCopyMs\":{},\"tileComposeMs\":{},\"bakeMs\":{},\"encodeMs\":{},\"dbReadMs\":{},\"decodeMs\":{},\"peakCacheBytes\":{},\"activeTasksPeak\":{},\"peakWorkerThreads\":{},\"worldWorkerThreads\":{},\"backend\":\"{}\",\"cpuTiles\":{}",
                 mode_slug(mode.mode),
                 mode_label(mode.mode),
                 mode.tile_count,
@@ -1572,27 +1510,23 @@ fn write_map_layout(
                 mode.stats.unique_chunks,
                 mode.stats.baked_chunks,
                 mode.stats.baked_regions,
+                mode.stats.region_chunks_copied,
+                mode.stats.region_chunks_out_of_bounds,
+                mode.stats.tile_missing_region_samples,
+                mode.stats.world_load_ms,
                 mode.stats.region_bake_ms,
+                mode.stats.region_copy_ms,
                 mode.stats.tile_compose_ms,
                 mode.stats.bake_ms,
                 mode.stats.encode_ms,
+                mode.stats.db_read_ms,
+                mode.stats.decode_ms,
                 mode.stats.peak_cache_bytes,
                 mode.stats.active_tasks_peak,
                 mode.stats.peak_worker_threads,
+                mode.stats.world_worker_threads,
                 mode.stats.resolved_backend.label(),
-                mode.stats.gpu_tiles,
-                mode.stats.cpu_tiles,
-                mode.stats.gpu_fallbacks,
-                mode.stats.gpu_batches,
-                mode.stats.gpu_batch_tiles,
-                mode.stats.gpu_max_in_flight,
-                mode.stats.gpu_queue_wait_ms,
-                mode.stats.gpu_worker_threads,
-                mode.stats.gpu_submit_workers,
-                mode.stats.gpu_buffer_reuses,
-                mode.stats.gpu_buffer_allocations,
-                mode.stats.gpu_staging_reuses,
-                mode.stats.gpu_staging_allocations
+                mode.stats.cpu_tiles
             );
             json.push('}');
             if mode_index + 1 != dimension.modes.len() {
@@ -1952,6 +1886,9 @@ fn parse_modes(value: &str) -> bedrock_render::Result<Vec<WebRenderMode>> {
         modes.push(match item.trim().to_ascii_lowercase().as_str() {
             "surface" => WebRenderMode::Surface,
             "heightmap" | "height" => WebRenderMode::HeightMap,
+            "raw-heightmap" | "raw_heightmap" | "rawheightmap" | "raw-height" => {
+                WebRenderMode::RawHeightMap
+            }
             "biome" => WebRenderMode::Biome,
             "layer" => WebRenderMode::Layer,
             "cave" => WebRenderMode::Cave,
@@ -2103,17 +2040,6 @@ fn parse_profile(value: &str) -> bedrock_render::Result<RenderExecutionProfile> 
         "interactive" => Ok(RenderExecutionProfile::Interactive),
         _ => Err(bedrock_render::BedrockRenderError::Validation(
             "--profile must be export or interactive".to_string(),
-        )),
-    }
-}
-
-fn parse_backend(value: &str) -> bedrock_render::Result<RenderBackend> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(RenderBackend::Auto),
-        "on" | "gpu" => Ok(RenderBackend::Gpu),
-        "off" | "cpu" => Ok(RenderBackend::Cpu),
-        _ => Err(bedrock_render::BedrockRenderError::Validation(
-            "--gpu must be auto, on, or off".to_string(),
         )),
     }
 }
@@ -2371,10 +2297,10 @@ fn cache_signature(
         .to_bits()
         .hash(&mut hasher);
     backend.cache_slug().hash(&mut hasher);
-    GPU_COMPOSE_SHADER_VERSION.hash(&mut hasher);
     hash_file_signature(&mut hasher, &world_path.join("level.dat"))?;
     hash_file_signature(&mut hasher, &world_path.join("db").join("CURRENT"))?;
     hash_file_signature(&mut hasher, &world_path.join("db").join("MANIFEST-000001"))?;
+    hash_file_signature(&mut hasher, &world_path.join("chunks.dat"))?;
     for path in palette_json_paths {
         hash_file_signature(&mut hasher, path)?;
     }
@@ -2439,7 +2365,7 @@ fn default_output_dir() -> PathBuf {
 fn print_help() {
     println!("render_web_map --world <path> --out <dir> [options]");
     println!("  --dimensions overworld,nether,end");
-    println!("  --mode surface,heightmap,biome,layer,cave");
+    println!("  --mode surface,heightmap,raw-heightmap,biome,layer,cave");
     println!(
         "  --y 64 --chunks-per-tile 16 --chunks-per-region 32 --blocks-per-pixel 1 --pixels-per-block 2"
     );
@@ -2458,11 +2384,7 @@ fn print_help() {
     println!("  --block-boundary-max-shadow value --block-boundary-line-width value");
     println!("  --region min_x,min_z,max_x,max_z --threads auto|1..512");
     println!("  --max-render-threads N --reserve-threads N");
-    println!("  --gpu auto|on|off --profile export|interactive");
-    println!("  --gpu-min-pixels N --gpu-max-in-flight 0|N");
-    println!("  --gpu-batch-size 0|N --gpu-batch-pixels 0|N");
-    println!("  --gpu-submit-workers 0|N --gpu-readback-workers 0|N");
-    println!("  --gpu-buffer-pool-bytes 0|N --gpu-staging-pool-bytes 0|N");
+    println!("  --profile export|interactive");
     println!("  --memory-budget auto|disabled|MiB --pipeline-depth N");
     println!("  --tile-batch-size auto|N --writer-threads N --write-queue-capacity N");
     println!("  --viewer-prefetch-radius N --viewer-retain-radius N --viewer-max-image-loads N");
@@ -2528,6 +2450,7 @@ fn mode_slug(mode: RenderMode) -> String {
     match mode {
         RenderMode::SurfaceBlocks => "surface".to_string(),
         RenderMode::HeightMap => "heightmap".to_string(),
+        RenderMode::RawHeightMap => "raw-heightmap".to_string(),
         RenderMode::Biome { y } => format!("biome-y{y}"),
         RenderMode::RawBiomeLayer { y } => format!("raw-biome-y{y}"),
         RenderMode::LayerBlocks { y } => format!("layer-y{y}"),
@@ -2539,6 +2462,7 @@ fn mode_label(mode: RenderMode) -> String {
     match mode {
         RenderMode::SurfaceBlocks => "Surface".to_string(),
         RenderMode::HeightMap => "Height Map".to_string(),
+        RenderMode::RawHeightMap => "Raw Height Map".to_string(),
         RenderMode::Biome { y } => format!("Biome Y {y}"),
         RenderMode::RawBiomeLayer { y } => format!("Raw Biome Y {y}"),
         RenderMode::LayerBlocks { y } => format!("Layer Y {y}"),
@@ -2621,7 +2545,7 @@ mod tests {
             layout,
             region_layout,
             soft,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2631,7 +2555,7 @@ mod tests {
             layout,
             region_layout,
             strong,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2652,7 +2576,7 @@ mod tests {
             layout,
             region_layout,
             soft,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2662,7 +2586,7 @@ mod tests {
             layout,
             region_layout,
             underwater,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2683,7 +2607,7 @@ mod tests {
             layout,
             region_layout,
             soft,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2693,7 +2617,7 @@ mod tests {
             layout,
             region_layout,
             land,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2714,7 +2638,7 @@ mod tests {
             layout,
             region_layout,
             soft,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2724,7 +2648,7 @@ mod tests {
             layout,
             region_layout,
             slope_softness,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2748,7 +2672,7 @@ mod tests {
             layout,
             region_layout,
             soft,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2758,7 +2682,7 @@ mod tests {
             layout,
             region_layout,
             edge,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2780,7 +2704,7 @@ mod tests {
             layout,
             region_layout,
             soft,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
@@ -2790,49 +2714,12 @@ mod tests {
             layout,
             region_layout,
             outlined,
-            RenderBackend::Auto,
+            RenderBackend::Cpu,
             &[],
             None,
         )
         .expect("outlined");
         assert_ne!(soft_signature, outlined_signature);
-    }
-
-    #[test]
-    fn cache_signature_changes_with_gpu_backend() {
-        let layout = RenderLayout::default();
-        let region_layout = RegionLayout::default();
-        let surface = SurfaceRenderOptions::default();
-        let world_path = default_world_path();
-        let cpu_signature = cache_signature(
-            &world_path,
-            layout,
-            region_layout,
-            surface,
-            RenderBackend::Cpu,
-            &[],
-            None,
-        )
-        .expect("cpu");
-        let gpu_signature = cache_signature(
-            &world_path,
-            layout,
-            region_layout,
-            surface,
-            RenderBackend::Gpu,
-            &[],
-            None,
-        )
-        .expect("gpu");
-        assert_ne!(cpu_signature, gpu_signature);
-    }
-
-    #[test]
-    fn parses_gpu_backend_switch() {
-        assert_eq!(parse_backend("auto").unwrap(), RenderBackend::Auto);
-        assert_eq!(parse_backend("on").unwrap(), RenderBackend::Gpu);
-        assert_eq!(parse_backend("off").unwrap(), RenderBackend::Cpu);
-        assert!(parse_backend("required").is_err());
     }
 
     #[test]
@@ -2900,10 +2787,9 @@ mod tests {
             layout: RenderLayout::default(),
             region_layout: RegionLayout::default(),
             surface_options: SurfaceRenderOptions::default(),
-            gpu_options: RenderGpuOptions::default(),
             region: None,
             threading: RenderThreadingOptions::Auto,
-            backend: RenderBackend::Auto,
+            backend: RenderBackend::Cpu,
             profile: RenderExecutionProfile::Export,
             memory_budget: RenderMemoryBudget::Auto,
             pipeline_depth: 0,

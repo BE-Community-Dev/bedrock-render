@@ -4,10 +4,12 @@ use bedrock_render::{
     RenderPalette, RenderThreadingOptions, RgbaColor, SurfaceRenderOptions, TerrainLightingOptions,
     TilePathScheme,
 };
-use bedrock_world::{BedrockLevelDbStorage, BedrockWorld, Dimension, NbtTag, OpenOptions};
+use bedrock_world::{BedrockWorld, Dimension, NbtTag, OpenOptions};
 use image::{ImageFormat as OutputImageFormat, save_buffer_with_format};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+mod common;
 
 const TILE_SIZE: u32 = 256;
 const TILE_SIZE_I32: i32 = 256;
@@ -18,6 +20,7 @@ const DEFAULT_LAYER_Y: i32 = 64;
 const DEFAULT_CAVE_Y: i32 = 32;
 
 fn main() -> bedrock_render::Result<()> {
+    common::init_logger();
     let config = parse_args()?;
     std::fs::create_dir_all(&config.output_dir).map_err(|error| {
         bedrock_render::BedrockRenderError::io(
@@ -29,15 +32,10 @@ fn main() -> bedrock_render::Result<()> {
         )
     })?;
 
-    let storage = Arc::new(
-        BedrockLevelDbStorage::open(config.world_path.join("db"))
+    let world = Arc::new(
+        BedrockWorld::open_blocking(config.world_path.clone(), OpenOptions::default())
             .map_err(bedrock_render::BedrockRenderError::World)?,
     );
-    let world = Arc::new(BedrockWorld::from_storage(
-        config.world_path.clone(),
-        storage,
-        OpenOptions::default(),
-    ));
     let palette =
         RenderPalette::default().with_unknown_biome_color(RgbaColor::new(96, 96, 96, 255));
     let renderer = MapRenderer::new(world, palette);
@@ -73,6 +71,12 @@ fn main() -> bedrock_render::Result<()> {
         &config,
         RenderMode::HeightMap,
         &config.output_dir.join("heightmap-viewport.png"),
+    )?;
+    render_viewport(
+        &renderer,
+        &config,
+        RenderMode::RawHeightMap,
+        &config.output_dir.join("raw-heightmap-viewport.png"),
     )?;
     render_viewport(
         &renderer,
@@ -131,10 +135,11 @@ fn parse_args() -> bedrock_render::Result<PreviewConfig> {
             "viewport_tiles must be a positive odd integer".to_string(),
         ));
     }
-    if !world_path.join("db").join("CURRENT").exists() {
+    if !world_path.join("db").join("CURRENT").exists() && !world_path.join("chunks.dat").exists() {
         return Err(bedrock_render::BedrockRenderError::Validation(format!(
-            "world db CURRENT not found: {}",
-            world_path.join("db").join("CURRENT").display()
+            "world storage not found: expected {} or {}",
+            world_path.join("db").join("CURRENT").display(),
+            world_path.join("chunks.dat").display()
         )));
     }
     Ok(PreviewConfig {
@@ -333,7 +338,7 @@ fn viewport_tiles(
         max_chunk_x,
         max_chunk_z,
     );
-    MapRenderer::plan_region_tiles(
+    MapRenderer::<std::sync::Arc<dyn bedrock_world::WorldStorage>>::plan_region_tiles(
         region,
         mode,
         ChunkTileLayout {

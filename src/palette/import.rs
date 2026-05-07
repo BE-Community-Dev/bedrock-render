@@ -4,9 +4,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 const BUILTIN_BLOCK_COLOR_JSON: &str = include_str!("../../data/colors/bedrock-block-color.json");
 const BUILTIN_BIOME_COLOR_JSON: &str = include_str!("../../data/colors/bedrock-biome-color.json");
+include!(concat!(env!("OUT_DIR"), "/builtin_palette_tables.rs"));
 
 /// An 8-bit RGBA color used by palettes and decoded render planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,13 +99,18 @@ enum StateColorSelector {
 
 impl Default for RenderPalette {
     fn default() -> Self {
-        Self::from_builtin_json_sources().unwrap_or_else(|error| {
-            panic!("embedded bedrock-render palette JSON is invalid: {error}")
-        })
+        Self::from_builtin_static_tables()
     }
 }
 
 impl RenderPalette {
+    /// Returns the shared embedded palette without reparsing bundled JSON.
+    #[must_use]
+    pub fn builtin_shared() -> Arc<Self> {
+        static PALETTE: OnceLock<Arc<RenderPalette>> = OnceLock::new();
+        Arc::clone(PALETTE.get_or_init(|| Arc::new(RenderPalette::default())))
+    }
+
     /// Creates the default embedded palette.
     #[must_use]
     pub fn new() -> Self {
@@ -121,6 +128,67 @@ impl RenderPalette {
         palette.merge_json_str(BUILTIN_BLOCK_COLOR_JSON)?;
         palette.merge_json_str(BUILTIN_BIOME_COLOR_JSON)?;
         Ok(palette)
+    }
+
+    /// Builds the embedded palette from build-time generated static tables.
+    #[must_use]
+    pub fn from_builtin_static_tables() -> Self {
+        let mut palette = Self::empty_with_builtin_defaults();
+        palette.insert_default_blocks();
+        palette.default_grass_color = rgba_from_static(BUILTIN_BIOME_DEFAULT_GRASS);
+        palette.default_foliage_color = rgba_from_static(BUILTIN_BIOME_DEFAULT_FOLIAGE);
+        palette.default_water_color = rgba_from_static(BUILTIN_BIOME_DEFAULT_WATER);
+        palette
+            .block_colors
+            .reserve(BUILTIN_BLOCK_COLORS.len().saturating_add(8));
+        for entry in BUILTIN_BLOCK_COLORS {
+            palette
+                .block_colors
+                .insert(entry.name.to_string(), rgba_from_static(entry.color));
+        }
+        palette.biome_colors.reserve(BUILTIN_BIOME_COLORS.len());
+        palette
+            .biome_grass_colors
+            .reserve(BUILTIN_BIOME_COLORS.len());
+        palette
+            .biome_foliage_colors
+            .reserve(BUILTIN_BIOME_COLORS.len());
+        palette
+            .biome_water_colors
+            .reserve(BUILTIN_BIOME_COLORS.len());
+        for entry in BUILTIN_BIOME_COLORS {
+            palette
+                .biome_colors
+                .insert(entry.id, rgba_from_static(entry.color));
+            palette
+                .biome_grass_colors
+                .insert(entry.id, rgba_from_static(entry.grass));
+            palette
+                .biome_foliage_colors
+                .insert(entry.id, rgba_from_static(entry.foliage));
+            palette
+                .biome_water_colors
+                .insert(entry.id, rgba_from_static(entry.water));
+        }
+        for rule in BUILTIN_STATE_RULES {
+            let rules = palette
+                .block_state_colors
+                .entry(rule.block.to_string())
+                .or_insert_with(|| BlockStateColorRules { rules: Vec::new() });
+            rules.rules.push(BlockStateColorRule {
+                state_name: rule.state.to_string(),
+                selector: selector_from_static(rule.selector),
+                color: rgba_from_static(rule.color),
+            });
+        }
+        for variant in BUILTIN_VARIANT_COLORS {
+            palette
+                .block_variant_colors
+                .entry(variant.block.to_string())
+                .or_default()
+                .insert(variant.variant.to_string(), rgba_from_static(variant.color));
+        }
+        palette
     }
 
     fn empty_with_builtin_defaults() -> Self {
@@ -346,21 +414,26 @@ impl RenderPalette {
             })
     }
 
-    /// Returns a surface block color with JSON-defined state overrides and biome tinting applied.
-    #[must_use]
-    pub(crate) fn surface_block_state_color(
+    pub(crate) fn surface_block_state_color_with_legacy_biome(
         &self,
         state: &BlockState,
         biome_id: Option<u32>,
+        legacy_biome_color: Option<RgbaColor>,
         biome_tint: bool,
     ) -> RgbaColor {
         let color = self.block_state_color(state);
+        let legacy_tint = legacy_biome_color.map(|color| with_alpha(color, 255));
         if is_grass_tinted_block(&state.name) {
             if is_surface_grass_block(&state.name) {
-                return self.surface_grass_block_color(color, biome_id, biome_tint);
+                let tint = if biome_tint {
+                    legacy_tint.or_else(|| self.biome_grass_tint(biome_id))
+                } else {
+                    None
+                };
+                return self.surface_grass_block_color_from_tint(color, tint);
             }
             let tint = if biome_tint {
-                self.biome_grass_tint(biome_id)
+                legacy_tint.or_else(|| self.biome_grass_tint(biome_id))
             } else {
                 None
             };
@@ -368,7 +441,7 @@ impl RenderPalette {
         }
         if is_foliage_tinted_block(&state.name) {
             let tint = if biome_tint {
-                self.biome_foliage_tint(biome_id)
+                legacy_tint.or_else(|| self.biome_foliage_tint(biome_id))
             } else {
                 None
             };
@@ -515,6 +588,14 @@ impl RenderPalette {
         } else {
             None
         };
+        self.surface_grass_block_color_from_tint(mask_color, tint)
+    }
+
+    fn surface_grass_block_color_from_tint(
+        &self,
+        mask_color: RgbaColor,
+        tint: Option<RgbaColor>,
+    ) -> RgbaColor {
         let tint = tint.unwrap_or(self.default_grass_color);
         let tinted = multiply_with_biome_tint(mask_color, Some(tint), self.default_grass_color);
         blend_toward_color(tinted, tint, 96)
@@ -881,6 +962,19 @@ fn normalize_block_name(name: &str) -> String {
         name.to_string()
     } else {
         format!("minecraft:{name}")
+    }
+}
+
+fn rgba_from_static(color: StaticColor) -> RgbaColor {
+    RgbaColor::new(color.red, color.green, color.blue, color.alpha)
+}
+
+fn selector_from_static(selector: StaticStateSelector) -> StateColorSelector {
+    match selector {
+        StaticStateSelector::IntRange { min, max } => StateColorSelector::IntRange { min, max },
+        StaticStateSelector::StringValues(values) => StateColorSelector::StringValues(
+            values.iter().map(|value| (*value).to_string()).collect(),
+        ),
     }
 }
 
@@ -1552,7 +1646,7 @@ mod tests {
         let mut palette = RenderPalette::default();
         palette
             .merge_json_str(
-                r##"{
+                r#"{
                     "blocks": {
                         "minecraft:standing_banner": {
                             "default": [255, 255, 255, 255],
@@ -1561,13 +1655,52 @@ mod tests {
                             }
                         }
                     }
-                }"##,
+                }"#,
             )
             .expect("variant colors should import");
 
         assert_eq!(
             palette.block_variant_color("minecraft:standing_banner", "banner_base_red"),
             Some(RgbaColor::new(160, 39, 34, 255))
+        );
+    }
+
+    #[test]
+    fn json_palette_imports_string_and_numeric_state_colors() {
+        let mut palette = RenderPalette::default();
+        palette
+            .merge_json_str(
+                r#"{
+                    "blocks": {
+                        "minecraft:concrete": {
+                            "default": [220, 220, 220, 255],
+                            "state_colors": {
+                                "color": [
+                                    {"min": 14, "max": 14, "color": [160, 39, 34, 255]},
+                                    {"values": ["blue"], "color": [44, 48, 138, 255]}
+                                ]
+                            }
+                        }
+                    }
+                }"#,
+            )
+            .expect("state colors should import");
+
+        assert_eq!(
+            palette.block_state_color(&test_block_state_with_int(
+                "minecraft:concrete",
+                "color",
+                14
+            )),
+            RgbaColor::new(160, 39, 34, 255)
+        );
+        assert_eq!(
+            palette.block_state_color(&test_block_state_with_string(
+                "minecraft:concrete",
+                "color",
+                "blue"
+            )),
+            RgbaColor::new(44, 48, 138, 255)
         );
     }
 
@@ -1749,6 +1882,48 @@ mod tests {
     }
 
     #[test]
+    fn builtin_static_tables_match_json_palette_for_hot_colors() {
+        let static_palette = RenderPalette::from_builtin_static_tables();
+        let json_palette = RenderPalette::from_builtin_json_sources()
+            .expect("built-in JSON palette should remain auditable");
+        for block in [
+            "minecraft:grass_block",
+            "minecraft:water",
+            "minecraft:acacia_log",
+            "minecraft:bed",
+            "minecraft:decorated_pot",
+        ] {
+            assert_eq!(
+                static_palette.block_color(block),
+                json_palette.block_color(block),
+                "{block} default color differs between static and JSON palette"
+            );
+        }
+        for biome in [0, 1, 7, 24, 48] {
+            assert_eq!(
+                static_palette.biome_color(biome),
+                json_palette.biome_color(biome),
+                "biome {biome} color differs between static and JSON palette"
+            );
+        }
+        let log_state = BlockState {
+            name: "minecraft:acacia_log".to_string(),
+            states: [("pillar_axis".to_string(), NbtTag::String("y".to_string()))]
+                .into_iter()
+                .collect(),
+            version: None,
+        };
+        assert_eq!(
+            static_palette.block_state_color(&log_state),
+            json_palette.block_state_color(&log_state)
+        );
+        assert_eq!(
+            static_palette.block_variant_color("minecraft:bed", "bed_blue"),
+            json_palette.block_variant_color("minecraft:bed", "bed_blue")
+        );
+    }
+
+    #[test]
     fn builtin_palette_sources_do_not_use_tainted_source_markers() {
         for source in [
             RenderPalette::builtin_block_color_json(),
@@ -1803,6 +1978,152 @@ mod tests {
                 "{name} should not be unknown"
             );
         }
+    }
+
+    #[test]
+    fn builtin_common_dyed_legacy_ids_use_state_colors() {
+        let palette = RenderPalette::default();
+        for (legacy_name, state_key, state_value, modern_name) in [
+            (
+                "minecraft:concrete",
+                "color",
+                "red",
+                "minecraft:red_concrete",
+            ),
+            (
+                "minecraft:concretePowder",
+                "color",
+                "blue",
+                "minecraft:blue_concrete_powder",
+            ),
+            ("minecraft:wool", "color", "green", "minecraft:green_wool"),
+            (
+                "minecraft:carpet",
+                "color",
+                "yellow",
+                "minecraft:yellow_carpet",
+            ),
+            (
+                "minecraft:stained_glass",
+                "color",
+                "cyan",
+                "minecraft:cyan_stained_glass",
+            ),
+            (
+                "minecraft:stained_glass_pane",
+                "color",
+                "purple",
+                "minecraft:purple_stained_glass_pane",
+            ),
+            (
+                "minecraft:shulker_box",
+                "color",
+                "orange",
+                "minecraft:orange_shulker_box",
+            ),
+            (
+                "minecraft:stained_hardened_clay",
+                "color",
+                "brown",
+                "minecraft:brown_terracotta",
+            ),
+        ] {
+            let legacy = palette.block_state_color(&test_block_state_with_string(
+                legacy_name,
+                state_key,
+                state_value,
+            ));
+            let modern = palette.block_color(modern_name);
+            assert!(
+                color_distance(legacy, modern) <= 12,
+                "{legacy_name} {state_value} should match {modern_name}: {legacy:?} vs {modern:?}"
+            );
+        }
+
+        let numeric_red = palette.block_state_color(&test_block_state_with_int(
+            "minecraft:concrete",
+            "color",
+            14,
+        ));
+        let named_red = palette.block_state_color(&test_block_state_with_string(
+            "minecraft:concrete",
+            "color",
+            "red",
+        ));
+        assert_eq!(numeric_red, named_red);
+    }
+
+    #[test]
+    fn builtin_bed_and_candle_colors_are_available() {
+        let palette = RenderPalette::default();
+        let red_bed = palette
+            .block_variant_color("minecraft:bed", "bed_red")
+            .expect("bed should include red variant");
+        let blue_bed = palette
+            .block_variant_color("minecraft:bed", "bed_blue")
+            .expect("bed should include blue variant");
+        assert!(color_distance(red_bed, blue_bed) >= 80);
+
+        let candle = palette.block_color("minecraft:candle");
+        let red_candle = palette.block_color("minecraft:red_candle");
+        let red_candle_cake = palette.block_color("minecraft:red_candle_cake");
+        assert!(candle.alpha == 255);
+        assert!(red_candle.red > red_candle.green);
+        assert_eq!(red_candle, red_candle_cake);
+    }
+
+    #[test]
+    fn builtin_red_sandstone_variants_stay_red_sand_family() {
+        let palette = RenderPalette::default();
+        let red_sand = palette.block_color("minecraft:red_sand");
+        let red_sandstone = palette.block_color("minecraft:red_sandstone");
+        let cut_red_sandstone = palette.block_color("minecraft:cut_red_sandstone");
+        let red_sandstone_slab = palette.block_color("minecraft:red_sandstone_slab");
+
+        for color in [
+            red_sand,
+            red_sandstone,
+            cut_red_sandstone,
+            red_sandstone_slab,
+        ] {
+            assert!(color.red > color.green);
+            assert!(color.green > color.blue);
+        }
+        assert!(color_distance(red_sandstone, cut_red_sandstone) <= 80);
+        assert!(color_distance(red_sandstone, red_sandstone_slab) <= 90);
+    }
+
+    #[test]
+    fn builtin_sand_state_colors_route_red_sand_variants() {
+        let palette = RenderPalette::default();
+        let sand = palette.block_color("minecraft:sand");
+        let red_sand = palette.block_color("minecraft:red_sand");
+
+        assert_eq!(palette.block_color("minecraft:sand"), sand);
+        assert_eq!(
+            palette.block_state_color(&test_block_state_with_string(
+                "minecraft:sand",
+                "sand_type",
+                "red",
+            )),
+            red_sand
+        );
+        assert_eq!(
+            palette.block_state_color(&test_block_state_with_string(
+                "minecraft:sand",
+                "variant",
+                "red_sand",
+            )),
+            red_sand
+        );
+        assert_eq!(
+            palette.block_state_color(&test_block_state_with_int("minecraft:sand", "data", 1)),
+            red_sand
+        );
+        assert_eq!(
+            palette.block_state_color(&test_block_state_with_int("minecraft:sand", "data", 0)),
+            sand
+        );
     }
 
     #[test]
@@ -2022,5 +2343,25 @@ mod tests {
         u16::from(left.red.abs_diff(right.red))
             + u16::from(left.green.abs_diff(right.green))
             + u16::from(left.blue.abs_diff(right.blue))
+    }
+
+    fn test_block_state_with_int(name: &str, key: &str, value: i32) -> BlockState {
+        let mut states = std::collections::BTreeMap::new();
+        states.insert(key.to_string(), NbtTag::Int(value));
+        BlockState {
+            name: name.to_string(),
+            states,
+            version: None,
+        }
+    }
+
+    fn test_block_state_with_string(name: &str, key: &str, value: &str) -> BlockState {
+        let mut states = std::collections::BTreeMap::new();
+        states.insert(key.to_string(), NbtTag::String(value.to_string()));
+        BlockState {
+            name: name.to_string(),
+            states,
+            version: None,
+        }
     }
 }
