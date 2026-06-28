@@ -1058,17 +1058,20 @@ fn parse_block_state_color_rules(value: &Value) -> Option<BlockStateColorRules> 
                 }
                 continue;
             }
-            let min = rule_map
+            let min_value = rule_map
                 .get("min")
                 .and_then(Value::as_i64)
                 .and_then(|value| i32::try_from(value).ok())?;
-            let max = rule_map
+            let max_value = rule_map
                 .get("max")
                 .and_then(Value::as_i64)
                 .and_then(|value| i32::try_from(value).ok())?;
             rules.push(BlockStateColorRule {
                 state_name: state_name.clone(),
-                selector: StateColorSelector::IntRange { min, max },
+                selector: StateColorSelector::IntRange {
+                    min: min_value,
+                    max: max_value,
+                },
                 color,
             });
         }

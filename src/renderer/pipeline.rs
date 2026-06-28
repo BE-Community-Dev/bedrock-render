@@ -12,7 +12,6 @@
     clippy::large_types_passed_by_value,
     clippy::manual_clamp,
     clippy::manual_contains,
-    clippy::manual_is_multiple_of,
     clippy::manual_let_else,
     clippy::map_unwrap_or,
     clippy::match_wildcard_for_single_variants,
