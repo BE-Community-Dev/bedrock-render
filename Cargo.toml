@@ -1,6 +1,6 @@
 [package]
 name = "bedrock-render"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,6 @@ documentation = "https://docs.rs/bedrock-render"
 readme = "README.md"
 keywords = ["minecraft", "bedrock", "render", "map", "mcbe"]
 categories = ["rendering", "game-development", "multimedia::images"]
-publish = false
 include = [
     "Cargo.toml",
     "README.md",
@@ -37,7 +36,7 @@ path = "src/bedrock_render.rs"
 
 [features]
 default = ["async", "webp"]
-async = ["dep:tokio", "bedrock-world/async"]
+async = ["dep:tokio", "bedrock-leveldb/async", "bedrock-world/async"]
 gpu-core = []
 gpu-dx11 = ["gpu-core", "dep:windows"]
 gpu-vulkan = ["gpu-core", "dep:pollster", "dep:wgpu", "wgpu/std", "wgpu/wgsl", "wgpu/vulkan"]
@@ -47,8 +46,8 @@ webp = ["image/webp"]
 png = ["image/png"]
 
 [dependencies]
-bedrock-leveldb = { path = "../bedrock-leveldb" }
-bedrock-world = { path = "../bedrock-world", default-features = true }
+bedrock-leveldb = { version = "0.2.2", path = "../bedrock-leveldb", default-features = false, features = ["zlib", "snappy"] }
+bedrock-world = { version = "0.2.2", path = "../bedrock-world", default-features = false, features = ["backend-bedrock-leveldb"] }
 crossbeam-channel = "0.5.15"
 image = { version = "0.25.6", default-features = false }
 indexmap = "2.12.1"
@@ -58,7 +57,7 @@ rayon = "1.11.0"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sysinfo = "0.38.0"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["rt", "sync"], optional = true }
+tokio = { version = "1.48.0", default-features = false, features = ["rt", "sync"], optional = true }
 wgpu = { version = "29.0.3", default-features = false, optional = true }
 windows = { version = "0.62.2", optional = true, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 zstd = "0.13.3"

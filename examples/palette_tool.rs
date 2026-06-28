@@ -1828,6 +1828,7 @@ fn clean_room_grass_tint_mask(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct DyeMaterial {
     id: i32,
     name: &'static str,
@@ -3391,7 +3392,7 @@ fn normalize_block_document(value: &Value) -> Result<Value> {
     };
     let mut normalized_blocks = Map::new();
     let mut block_entries = blocks.iter().collect::<Vec<_>>();
-    block_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    block_entries.sort_by_key(|(left, _)| *left);
     for (block_name, entry) in block_entries {
         normalized_blocks.insert(
             block_name.clone(),
@@ -3415,7 +3416,7 @@ fn normalize_block_entry(block_name: &str, entry: &Value) -> Result<Value> {
     };
     let mut normalized = Map::new();
     let mut texture_entries = textures.iter().collect::<Vec<_>>();
-    texture_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    texture_entries.sort_by_key(|(left, _)| *left);
     for (key, value) in texture_entries {
         let normalized_value = match key.as_str() {
             "fallback_reason"
@@ -3445,7 +3446,7 @@ fn normalize_variant_colors(block_name: &str, value: &Value) -> Result<Value> {
     };
     let mut normalized = Map::new();
     let mut variants = map.iter().collect::<Vec<_>>();
-    variants.sort_by(|(left, _), (right, _)| left.cmp(right));
+    variants.sort_by_key(|(left, _)| *left);
     for (variant, color) in variants {
         normalized.insert(
             variant.clone(),
@@ -3463,7 +3464,7 @@ fn normalize_state_colors(block_name: &str, value: &Value) -> Result<Value> {
     };
     let mut normalized = Map::new();
     let mut states = map.iter().collect::<Vec<_>>();
-    states.sort_by(|(left, _), (right, _)| left.cmp(right));
+    states.sort_by_key(|(left, _)| *left);
     for (state_name, rules) in states {
         let Some(rules) = rules.as_array() else {
             return Err(validation(format!(

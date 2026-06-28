@@ -1206,9 +1206,7 @@ fn render_thread_limit(config: &WebMapConfig) -> usize {
         allowed = allowed.min(max_render_threads);
     }
     if config.reserve_threads > 0 {
-        let available = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
         allowed = allowed.min(available.saturating_sub(config.reserve_threads).max(1));
     }
     allowed.max(1)
@@ -1223,9 +1221,7 @@ fn threading_for_threads(threads: usize) -> RenderThreadingOptions {
 }
 
 fn world_scan_threading(config: &WebMapConfig) -> WorldThreadingOptions {
-    let available = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1);
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
     let threads = available.min(render_thread_limit(config)).max(1);
     if threads <= 1 {
         WorldThreadingOptions::Single
@@ -1406,7 +1402,7 @@ fn planned_tile_for_coord(
             max_chunk_z,
         ),
         layout,
-        chunk_positions: Some(chunk_positions),
+        chunk_positions: Some(chunk_positions.into()),
     })
 }
 

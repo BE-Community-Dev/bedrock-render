@@ -6,8 +6,8 @@
 - `MapRenderer` for tile, batch, region, bake, and web-map rendering.
 - `MapRenderSession` for long-lived interactive renderers with cache reuse and
   streaming tile events.
-- `bedrock_render::editor` for explicit v0.2.0 writable map tooling over
-  `bedrock-world` map/global/HSA/actor/block-entity/heightmap/biome records.
+- `bedrock_render::editor` for downstream map-viewer tooling that maps common
+  `bedrock-world` typed writes to render/UI invalidation.
 - Value types for layout, threading, memory budgets, diagnostics, and cached
   tile paths.
 
@@ -88,17 +88,25 @@ that prefers an async channel, use `render_web_tiles_streaming_channel`; it
 returns a `tokio::sync::mpsc::Receiver<TileStreamEvent>` immediately and lets
 the render task continue in the background.
 
+Use `render_web_tiles_streaming_blocking_v2`,
+`render_web_tiles_streaming_v2`, or `render_web_tiles_streaming_channel_v2`
+when a UI wants decoded pixels instead of encoded tile bytes. These APIs emit
+`TileStreamEventV2::Ready` with `DecodedTileImage`; `RenderTileOutputOptions`
+selects `TilePixelFormat::Rgba8` by default or `Bgra8` for consumers that
+prefer BGRA byte order.
+
 ## Editor Facade
 
-Rendering remains read-only by default. Use `bedrock_render::editor` only for
-explicit write-mode workflows. The module re-exports the common `bedrock-world`
-v0.2 map/global/HSA/actor/block-entity/heightmap/biome/query/write-guard types
-and adds two render-facing helpers:
+Rendering remains read-only by default. `bedrock_render::editor` is a downstream
+adapter for explicit write-mode workflows; it does not change the
+`bedrock-world` storage-layer API. The module re-exports common
+`bedrock-world` v0.2 map/global/HSA/actor/block-entity/heightmap/biome/query
+types and adds two render-facing helpers:
 
 - `MapWorldEditor` opens or wraps a writable `BedrockWorld` and exposes common
   structured editor calls.
-- `MapEditInvalidation` describes which metadata, overlays, chunks, and tile
-  caches must be refreshed after a write.
+- `MapEditInvalidation` describes which render/UI metadata, overlays, chunks,
+  and tile caches should be refreshed after a write.
 
 ```rust
 use bedrock_render::editor::{MapWorldEditor, WorldScanOptions};
@@ -123,6 +131,8 @@ modern actors, block entities, heightmaps, and biome storage. Use
 tool-specific validation. Applications should still require a per-operation
 confirmation before mutating methods and should increment UI generations before
 refreshing overlays or tiles so stale background results are ignored.
+`MapEditInvalidation` is not serialized to Bedrock data and is not part of
+`bedrock-world`'s storage semantics.
 
 ### Replacing older entry points
 
@@ -196,13 +206,19 @@ Old Bedrock/Pocket Edition chunks may expose only `LegacyTerrain` tag `0x30`.
 - If a transition chunk has both `LegacyTerrain` and `SubChunkPrefix`, subchunk
   block data wins and legacy terrain is only a fallback for missing block data.
 
-The renderer cache version is `RENDERER_CACHE_VERSION = 48`, so old
+The renderer cache version is `RENDERER_CACHE_VERSION = 51`, so old
 transparent, incorrectly sampled, raw-height-driven, misplaced region-compose,
-renderer-rescanned, or incorrectly prioritized legacy-biome tiles are not
-reused. `RenderOptions::default()` bypasses tile cache reads/writes; opt in
-with `RenderCachePolicy::Use` when a session or export should use the cache.
+renderer-rescanned, incorrectly prioritized legacy-biome, or pre-authority-cache
+tiles are not reused. `RenderOptions::default()` bypasses tile cache
+reads/writes; opt in with `RenderCachePolicy::Use` when a session or export
+should use the cache.
 `MapRenderSession::new` also lifts stale lower renderer versions to the current
 version before creating cache keys.
+
+Sessions write an authority cache for final tiles. The cache stores tile blob
+entries, empty-tile sentinels, chunk dependency stamps, and reverse
+chunk-to-tile references so later batches can trust or reject cached decoded
+pixels without reloading every source chunk.
 
 `RenderPipelineStats` exposes placement diagnostics for web/region pipelines:
 `region_chunks_copied`, `region_chunks_out_of_bounds`, and
@@ -232,9 +248,10 @@ Display strings are for humans and may become more descriptive over time.
 
 ## GPU Backend
 
-The default feature set includes `gpu`. `RenderBackend::Auto` now attempts GPU
-compose for tiles at or above `RenderGpuOptions::min_pixels`, then falls back to
-CPU when the GPU feature, adapter, tile shape, or shader path is unavailable.
+GPU backends are opt-in with `gpu`, `gpu-dx11`, `gpu-vulkan`, or `gpu-dx12`.
+`RenderBackend::Auto` attempts GPU compose for tiles at or above
+`RenderGpuOptions::min_pixels`, then falls back to CPU when the GPU feature,
+adapter, tile shape, or shader path is unavailable.
 `RenderBackend::Gpu` forces the attempt. `RenderGpuFallbackPolicy::Required`
 turns these fallback cases into errors instead of CPU renders. GPU failures are
 reported through `RenderPipelineStats::gpu_fallback_reason` and counted as CPU

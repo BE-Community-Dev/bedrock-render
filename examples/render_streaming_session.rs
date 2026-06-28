@@ -95,8 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match source {
                             TileReadySource::MemoryCache
                             | TileReadySource::DiskCacheFresh
-                            | TileReadySource::DiskCacheStale
-                            | TileReadySource::DiskCacheOptimistic => {
+                            | TileReadySource::DiskCacheStale => {
                                 cached.fetch_add(1, Ordering::Relaxed);
                             }
                             TileReadySource::Render => {
@@ -119,16 +118,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             planned.job.coord.x, planned.job.coord.z
                         );
                     }
+                    TileStreamEvent::Empty { planned } => {
+                        println!("empty tile ({}, {})", planned.job.coord.x, planned.job.coord.z);
+                    }
                     TileStreamEvent::Progress(progress) => {
                         println!(
                             "progress {}/{}",
                             progress.completed_tiles, progress.total_tiles
-                        );
-                    }
-                    TileStreamEvent::CacheValidation { planned, outcome } => {
-                        println!(
-                            "cache validation {:?} tile ({}, {})",
-                            outcome, planned.job.coord.x, planned.job.coord.z
                         );
                     }
                     TileStreamEvent::Complete { diagnostics, stats } => {

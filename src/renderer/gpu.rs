@@ -898,6 +898,7 @@ mod imp {
             backend: RenderGpuBackend,
             fallback_policy: RenderGpuFallbackPolicy,
         ) -> Result<GpuProcessResult> {
+            let _ = self;
             if matches!(fallback_policy, RenderGpuFallbackPolicy::Required) {
                 return Err(BedrockRenderError::Validation(
                     "bedrock-render was built without GPU features".to_string(),

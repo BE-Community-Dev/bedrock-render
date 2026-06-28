@@ -9,7 +9,8 @@ threading, previews, and benchmarks live in this separate crate so the world
 parser remains lightweight.
 
 This repository is designed to be checked out independently. The current MSRV is
-Rust 1.88, and the default feature set includes `async`, `webp`, and `gpu`.
+Rust 1.88, and the default feature set includes `async` and `webp`. GPU
+backends are opt-in through `gpu`, `gpu-dx11`, `gpu-vulkan`, or `gpu-dx12`.
 CPU-only consumers can build with `--no-default-features` and opt into the image
 formats they need.
 
@@ -36,10 +37,6 @@ formats they need.
 - Interactive frontends should create one `MapRenderSession` per opened world.
   A session holds the renderer, tile cache, and diagnostics context so panning
   and zooming do not reopen the world or rebuild cache state for every batch.
-- Editing is explicit. Use `bedrock_render::editor::MapWorldEditor` only after
-  the user has entered write mode; normal render sources remain read-only.
-  Mutating editor calls return `MapEditInvalidation` so frontends can refresh
-  metadata, overlays, affected chunks, and tile caches deterministically.
 - `RenderMemoryBudget::Auto` uses a bounded cache budget for chunk bakes and
   export waves. `FixedBytes` and `Disabled` are available for offline tooling.
 - Long operations support explicit cancellation and progress callbacks.
@@ -87,10 +84,13 @@ Real legacy payloads are decoded as `[biome_id, red, green, blue]`, while
 `legacy_biome_colors` remains only a compatibility `0x00RRGGBB` view. Water
 keeps the normal water-tint path and does not use legacy grass RGB.
 
-Renderer cache version `48` invalidates tiles created before the single
-canonical visual surface sampler. `RenderOptions::default()` now bypasses the
-tile cache; set `cache_policy: RenderCachePolicy::Use` explicitly for session
-or export paths that should read/write cached images.
+Renderer cache version `51` invalidates tiles created before the single
+canonical visual surface sampler and the authority cache index/blob layout.
+`RenderOptions::default()` now bypasses the tile cache; set
+`cache_policy: RenderCachePolicy::Use` explicitly for session or export paths
+that should read/write cached images. Long-lived sessions use a tile authority
+cache to record final tile blobs, empty-tile entries, chunk dependency stamps,
+and reverse chunk-to-tile references before trusting cached decoded pixels.
 
 ## API Sketch
 
@@ -130,11 +130,11 @@ read-only `chunks.dat` worlds.
 
 ## Editing Facade
 
-`bedrock_render::editor` is the v0.2.0 writable boundary for map viewers and
-tooling. It re-exports the common `bedrock-world` map/global/HSA/actor/block
-entity/heightmap/biome types and wraps them in a small render-aware facade.
-Use it for common map editor actions; call `bedrock-world` directly when a tool
-needs lower-level Bedrock records or custom validation.
+`bedrock_render::editor` is a downstream adapter for map viewers and tooling,
+not the core `bedrock-world` storage API. Rendering sources remain read-only by
+default. Applications that already require explicit write mode can use
+`MapWorldEditor` to call common `bedrock-world` typed write APIs and receive a
+render/UI invalidation summary.
 
 ```rust
 use bedrock_render::editor::{MapWorldEditor, WorldScanOptions};
@@ -152,8 +152,10 @@ if invalidation.clear_tile_cache() {
 ```
 
 Write paths should still be guarded by an application-level confirmation step.
-After a successful edit, increment UI generations before scheduling overlay or
-tile reload work so stale background results cannot repaint the old state.
+`MapEditInvalidation` is a render-layer cache refresh contract; it is not stored
+in Bedrock data and is not part of `bedrock-world`'s storage layer. After a
+successful edit, increment UI generations before scheduling overlay or tile
+reload work so stale background results cannot repaint the old state.
 
 ## Streaming Session API
 
@@ -261,6 +263,12 @@ a local world:
 ```text
 cargo run --example render_streaming_session -- <world_path>
 ```
+
+For UI image caches that want decoded pixels directly, use
+`render_web_tiles_streaming_blocking_v2`, `render_web_tiles_streaming_v2`, or
+`render_web_tiles_streaming_channel_v2`. These emit `TileStreamEventV2::Ready`
+with `DecodedTileImage` pixels in `TilePixelFormat::Rgba8` by default, or
+`Bgra8` when requested through `RenderTileOutputOptions`.
 
 ## Preview Tool
 
@@ -530,7 +538,9 @@ Fixed Y cave diagnostic map for air, solid blocks, water, and lava.
   visible tile coverage.
 - Cache keys include world path hash, world file signature, renderer version,
   palette version, dimension, render mode, Y layer, and layout. All-transparent
-  stale cached tiles are rejected by the UI and regenerated.
+  stale cached tiles are rejected by the UI and regenerated. The authority cache
+  records chunk dependency stamps plus reverse chunk-to-tile references for
+  validation and invalidation.
 - `ImageFormat::Rgba` is the lowest-latency UI path. WebP/PNG are intended for
   cache/export/preview paths.
 - `RenderOptions::gpu` controls GPU backend, fallback policy, diagnostics, and

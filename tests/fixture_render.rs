@@ -3,7 +3,8 @@
 #[cfg(feature = "webp")]
 use bedrock_render::{
     ChunkRegion, MapRenderSession, MapRenderSessionConfig, RenderCachePolicy,
-    RenderExecutionProfile, RenderLayout, RenderThreadingOptions, TileReadySource, TileStreamEvent,
+    RenderExecutionProfile, RenderLayout, RenderThreadingOptions, RenderTileOutputOptions,
+    TilePixelFormat, TileReadySource, TileStreamEvent, TileStreamEventV2,
 };
 use bedrock_render::{
     ImageFormat, MapRenderer, RenderJob, RenderMode, RenderOptions, RenderPalette, TileCoord,
@@ -173,6 +174,98 @@ fn streaming_session_emits_rendered_then_cached_events() {
         .expect("cached streaming render");
     assert_eq!(cached.load(Ordering::Relaxed), 1);
     assert_eq!(complete.load(Ordering::Relaxed), 2);
+
+    let _ = std::fs::remove_dir_all(cache_root);
+}
+
+#[cfg(feature = "webp")]
+#[test]
+fn streaming_session_v2_emits_rgba_tiles_from_render_by_default() {
+    let world_path = fixture_world_path();
+    if !world_path.join("db").join("CURRENT").exists() {
+        return;
+    }
+    let storage =
+        Arc::new(BedrockLevelDbStorage::open_read_only(world_path.join("db")).expect("open db"));
+    let world = Arc::new(BedrockWorld::from_storage(
+        world_path,
+        storage,
+        OpenOptions::default(),
+    ));
+    let renderer = MapRenderer::new(Arc::clone(&world), RenderPalette::default());
+    let cache_root = unique_cache_root();
+    let session = MapRenderSession::new(
+        renderer,
+        MapRenderSessionConfig {
+            cache_root: cache_root.clone(),
+            world_id: "fixture".to_string(),
+            world_signature: "streaming-v2-test".to_string(),
+            cull_missing_chunks: true,
+            ..MapRenderSessionConfig::default()
+        },
+    );
+    let layout = RenderLayout {
+        chunks_per_tile: 1,
+        blocks_per_pixel: 16,
+        pixels_per_block: 1,
+    };
+    let mut planned_tiles =
+        MapRenderer::<std::sync::Arc<dyn bedrock_world::WorldStorage>>::plan_region_tiles(
+            ChunkRegion::new(Dimension::Overworld, 0, 0, 0, 0),
+            RenderMode::Biome { y: 64 },
+            layout,
+        )
+        .expect("plan tile");
+    assert_eq!(planned_tiles.len(), 1);
+    planned_tiles[0].chunk_positions = Some(
+        vec![bedrock_world::ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        }]
+        .into(),
+    );
+
+    let output = RenderTileOutputOptions::default();
+    let rendered_tiles = Arc::new(AtomicUsize::new(0));
+    let complete = Arc::new(AtomicUsize::new(0));
+    session
+        .render_web_tiles_streaming_blocking_v2(
+            &planned_tiles,
+            RenderOptions {
+                threading: RenderThreadingOptions::Single,
+                execution_profile: RenderExecutionProfile::Interactive,
+                cache_policy: RenderCachePolicy::Use,
+                tile_cache_validation_seed: 42,
+                ..RenderOptions::default()
+            },
+            output,
+            {
+                let rendered_tiles = Arc::clone(&rendered_tiles);
+                let complete = Arc::clone(&complete);
+                move |event| {
+                    match event {
+                        TileStreamEventV2::Ready {
+                            tile,
+                            source: TileReadySource::Render,
+                            ..
+                        } => {
+                            assert_eq!(tile.pixel_format, TilePixelFormat::Rgba8);
+                            assert!(!tile.pixels.is_empty());
+                            rendered_tiles.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TileStreamEventV2::Complete { .. } => {
+                            complete.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .expect("first v2 streaming render");
+    assert_eq!(rendered_tiles.load(Ordering::Relaxed), 1);
+    assert_eq!(complete.load(Ordering::Relaxed), 1);
 
     let _ = std::fs::remove_dir_all(cache_root);
 }

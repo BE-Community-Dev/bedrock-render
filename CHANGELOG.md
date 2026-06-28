@@ -2,6 +2,42 @@
 
 All notable changes to `bedrock-render` are tracked here.
 
+## 0.2.1 - 2026-06-29
+
+### Added
+
+- Added an authoritative final-tile cache index/blob alongside the manifest
+  probe cache. Session rendering can now validate tile dependencies by world
+  signature, chunk state, and tile-to-chunk references before trusting cached
+  decoded output.
+- Added decoded v2 streaming APIs through `TileStreamEventV2`,
+  `DecodedTileImage`, `RenderTileOutputOptions`, and `TilePixelFormat`, with
+  RGBA8 output by default and BGRA8 available for UI toolkits that prefer it.
+- Added tile index cache diagnostics to `RenderPipelineStats` for trusted hits,
+  validated hits, misses, empty hits, and index read time.
+
+### Changed
+
+- Prepared the crate for crates.io publishing by removing `publish = false` and
+  declaring versioned `bedrock-leveldb 0.2.2` and `bedrock-world 0.2.2`
+  dependencies while retaining local repository paths for development.
+- Bumped `RENDERER_CACHE_VERSION` to `51`; cached tiles from older cache
+  layouts or pre-authority validation are invalidated.
+- Clarified the `editor` module as a downstream adapter over the core
+  `bedrock-world` write APIs.
+- Kept GPU backends opt-in. The default crate features are `async` and `webp`;
+  `gpu`, `gpu-dx11`, `gpu-vulkan`, and `gpu-dx12` remain explicit feature
+  choices.
+
+### Breaking Changes
+
+- `TileImage::rgba` is now shared as `Arc<[u8]>` so streaming sessions and cache
+  readers can pass decoded pixels without extra copies.
+- `PlannedTile::chunk_positions` is optional, allowing render-index planning to
+  defer or reuse chunk dependency sets.
+- Existing renderer tile caches must be rebuilt because renderer cache version
+  `51` uses the authority index/blob layout.
+
 ## 0.2.0 - 2026-05-07
 
 ### Added

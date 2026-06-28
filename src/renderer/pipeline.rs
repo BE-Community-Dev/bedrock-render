@@ -32,6 +32,11 @@
     clippy::used_underscore_binding
 )]
 
+use super::cache::{
+    TILE_AUTHORITY_FLAG_EMPTY, TILE_AUTHORITY_FLAG_NON_EMPTY, TileAuthorityBlobReader,
+    TileAuthorityCache, TileAuthorityCacheKey, TileAuthorityChunkState, TileAuthorityChunkTileRef,
+    TileAuthorityCommit, TileAuthorityDependency, TileAuthorityEntry, TileAuthorityIndexSnapshot,
+};
 use super::gpu::{GpuProcessResult, GpuRenderContext};
 use crate::error::{BedrockRenderError, Result};
 use crate::palette::{RenderPalette, RgbaColor};
@@ -55,7 +60,6 @@ use image::{ExtendedColorType, ImageEncoder};
 use rayon::ThreadPoolBuilder;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -67,7 +71,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Renderer cache schema version used in tile cache keys.
-pub const RENDERER_CACHE_VERSION: u32 = 48;
+pub const RENDERER_CACHE_VERSION: u32 = 51;
 /// Default embedded palette version used in tile cache keys.
 pub const DEFAULT_PALETTE_VERSION: u32 = 16;
 /// Maximum fixed worker thread count accepted by render options.
@@ -83,8 +87,6 @@ const SESSION_BATCH_CULL_FULL_INDEX_THRESHOLD_CHUNKS: usize = 4096;
 const MISSING_HEIGHT: i16 = i16::MIN;
 const INTERACTIVE_STREAM_MIN_GROUP_TILES: usize = 2;
 const INTERACTIVE_STREAM_MAX_GROUP_TILES: usize = 6;
-/// Chunk-bake sidecar cache schema version.
-pub const CHUNK_BAKE_CACHE_VERSION: u32 = 4;
 const FAST_RGBA_ZSTD_MAGIC: &[u8; 4] = b"BRT2";
 const FAST_RGBA_ZSTD_V1_VERSION: u32 = 1;
 const FAST_RGBA_ZSTD_VERSION: u32 = 2;
@@ -99,6 +101,7 @@ const FAST_RGBA_ZSTD_KNOWN_FLAGS: u32 =
 const FAST_RGBA_ZSTD_LEVEL: i32 = 1;
 const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+#[cfg(test)]
 static TILE_CACHE_WRITE_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Source of render-ready chunk data used by [`MapRenderer`].
@@ -245,6 +248,33 @@ pub enum ImageFormat {
     FastRgbaZstd,
     /// Return raw RGBA pixels without encoded bytes.
     Rgba,
+}
+
+/// Decoded pixel layout used by interactive tile streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TilePixelFormat {
+    /// Red, green, blue, alpha byte order.
+    Rgba8,
+    /// Blue, green, red, alpha byte order.
+    ///
+    /// This output requires a per-tile RGBA-to-BGRA conversion and allocation.
+    /// Prefer [`TilePixelFormat::Rgba8`] for latency-sensitive interactive streams.
+    Bgra8,
+}
+
+/// Output contract for the v2 decoded tile stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderTileOutputOptions {
+    /// Pixel order emitted in [`DecodedTileImage::pixels`].
+    pub pixel_format: TilePixelFormat,
+}
+
+impl Default for RenderTileOutputOptions {
+    fn default() -> Self {
+        Self {
+            pixel_format: TilePixelFormat::Rgba8,
+        }
+    }
 }
 
 /// A single tile render request.
@@ -520,7 +550,7 @@ pub struct PlannedTile {
     /// Layout used to produce the job.
     pub layout: ChunkTileLayout,
     /// Optional exact chunk positions for sparse exports.
-    pub chunk_positions: Option<Vec<ChunkPos>>,
+    pub chunk_positions: Option<Arc<[ChunkPos]>>,
 }
 
 impl PlannedTile {
@@ -626,9 +656,8 @@ impl Default for RenderOptions {
 impl RenderOptions {
     /// Returns an aggressive interactive profile intended for viewport rendering.
     ///
-    /// This keeps final tiles exact, but enables faster surface loading,
-    /// tile cache usage, and sidecar chunk-bake caching when used with
-    /// [`MapRenderSessionConfig::max_speed`].
+    /// This keeps final tiles exact, but enables faster surface loading and
+    /// final tile cache usage when used with [`MapRenderSessionConfig::max_speed`].
     #[must_use]
     pub fn max_speed_interactive() -> Self {
         Self {
@@ -642,7 +671,6 @@ impl RenderOptions {
             performance: RenderPerformanceOptions {
                 profile: RenderPerformanceProfile::MaxSpeed,
                 progressive_preview: true,
-                sidecar_cache: RenderSidecarCachePolicy::Persistent,
                 surface_load: RenderSurfaceLoadPolicy::HintThenVerify,
             },
             ..Self::default()
@@ -664,7 +692,6 @@ impl RenderOptions {
             performance: RenderPerformanceOptions {
                 profile: RenderPerformanceProfile::MaxSpeed,
                 progressive_preview: false,
-                sidecar_cache: RenderSidecarCachePolicy::Persistent,
                 surface_load: RenderSurfaceLoadPolicy::HintThenVerify,
             },
             ..Self::default()
@@ -822,28 +849,6 @@ pub enum RenderPerformanceProfile {
     MaxSpeed,
 }
 
-/// Sidecar chunk-bake cache policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum RenderSidecarCachePolicy {
-    /// Disable chunk-bake cache lookups and writes.
-    #[default]
-    Disabled,
-    /// Use only the session in-memory chunk-bake cache.
-    MemoryOnly,
-    /// Use in-memory cache plus deterministic files under the session cache root.
-    Persistent,
-}
-
-impl RenderSidecarCachePolicy {
-    pub(super) const fn uses_cache(self) -> bool {
-        matches!(self, Self::MemoryOnly | Self::Persistent)
-    }
-
-    const fn writes_disk(self) -> bool {
-        matches!(self, Self::Persistent)
-    }
-}
-
 /// Surface record-loading strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum RenderSurfaceLoadPolicy {
@@ -861,8 +866,6 @@ pub struct RenderPerformanceOptions {
     pub profile: RenderPerformanceProfile,
     /// Emit preview stream events before final exact rendered events when possible.
     pub progressive_preview: bool,
-    /// Chunk-bake sidecar cache policy.
-    pub sidecar_cache: RenderSidecarCachePolicy,
     /// Surface subchunk loading policy.
     pub surface_load: RenderSurfaceLoadPolicy,
 }
@@ -1024,22 +1027,34 @@ pub struct RenderPipelineStats {
     pub cache_read_ms: u128,
     /// Time spent decoding tile cache bytes, in milliseconds.
     pub cache_decode_ms: u128,
+    /// Time spent decoding persisted tile blob payloads, in milliseconds.
+    pub tile_blob_decode_ms: u128,
     /// Elapsed time until the first cache-ready tile was emitted.
     pub cache_first_ready_ms: u128,
     /// Region cache hits.
     pub region_cache_hits: usize,
     /// Region cache misses.
     pub region_cache_misses: usize,
-    /// Chunk-bake sidecar cache hits.
-    pub chunk_bake_cache_hits: usize,
-    /// Chunk-bake sidecar cache misses.
-    pub chunk_bake_cache_misses: usize,
-    /// Chunk-bake sidecar in-memory hits.
-    pub chunk_bake_cache_memory_hits: usize,
-    /// Chunk-bake sidecar persistent hits.
-    pub chunk_bake_cache_disk_hits: usize,
-    /// Chunk-bake sidecar writes.
-    pub chunk_bake_cache_writes: usize,
+    /// Tile-index trusted fast-path hits.
+    pub tile_index_trusted_hits: usize,
+    /// Tile-index hits that required dependency validation.
+    pub tile_index_validated_hits: usize,
+    /// Tile-index misses.
+    pub tile_index_misses: usize,
+    /// Tile-index empty negative hits.
+    pub tile_index_empty_hits: usize,
+    /// Time spent reading tile-index data, in milliseconds.
+    pub tile_index_read_ms: u128,
+    /// Time spent validating tile dependencies, in milliseconds.
+    pub tile_dep_validation_ms: u128,
+    /// Persistent tile-cache writer drops caused by queue pressure or unavailable writer.
+    pub tile_cache_writer_dropped: usize,
+    /// Whether the world quick signature allowed trusted tile-index reads.
+    pub world_signature_trusted: bool,
+    /// Whether the world quick signature changed relative to the loaded index.
+    pub world_signature_changed: bool,
+    /// Tile-index entries rejected due to corrupt index/blob/decode state.
+    pub index_corrupt_misses: usize,
     /// Time spent baking chunks, in milliseconds.
     pub bake_ms: u128,
     /// Time spent loading world render records, in milliseconds.
@@ -2412,10 +2427,25 @@ pub struct TileImage {
     pub width: u32,
     /// Image height in pixels.
     pub height: u32,
-    /// Raw RGBA bytes.
-    pub rgba: Vec<u8>,
+    /// Raw RGBA bytes shared between stream consumers and caches.
+    pub rgba: Arc<[u8]>,
     /// Encoded image bytes when an encoded format was requested.
     pub encoded: Option<Vec<u8>>,
+}
+
+/// Decoded tile pixels emitted by the interactive v2 tile stream.
+#[derive(Debug, Clone)]
+pub struct DecodedTileImage {
+    /// Tile coordinate rendered by this image.
+    pub coord: TileCoord,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Raw decoded pixel bytes in `pixel_format` order.
+    pub pixels: Arc<[u8]>,
+    /// Byte order used by `pixels`.
+    pub pixel_format: TilePixelFormat,
 }
 
 /// Decoded bytes from a `FastRgbaZstd` tile cache entry.
@@ -2429,6 +2459,12 @@ pub struct FastRgbaZstdTile {
     pub validation_value: Option<u64>,
     /// Raw RGBA bytes.
     pub rgba: Vec<u8>,
+}
+
+struct FastRgbaZstdSharedTile {
+    width: u32,
+    height: u32,
+    rgba: Arc<[u8]>,
 }
 
 /// Header metadata from a `FastRgbaZstd` tile cache entry.
@@ -2643,16 +2679,6 @@ pub struct RegionBake {
     pub chunks_copied: usize,
     /// Baked chunks skipped because their position was outside this region payload.
     pub chunks_out_of_bounds: usize,
-    /// Chunk bakes satisfied from the sidecar cache.
-    pub chunk_bake_cache_hits: usize,
-    /// Chunk bakes missed in the sidecar cache.
-    pub chunk_bake_cache_misses: usize,
-    /// Chunk bakes satisfied from in-memory sidecar cache.
-    pub chunk_bake_cache_memory_hits: usize,
-    /// Chunk bakes satisfied from persistent sidecar cache.
-    pub chunk_bake_cache_disk_hits: usize,
-    /// Chunk bakes written to sidecar cache.
-    pub chunk_bake_cache_writes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2766,7 +2792,11 @@ fn resolved_backend_from_gpu(backend: RenderGpuBackend) -> ResolvedRenderBackend
 
 impl RenderGpuDiagnostics {
     fn add(&mut self, other: Self) {
-        if self.tiles == 0 && self.fallback_reason.is_none() {
+        if other.tiles != 0
+            && (self.tiles == 0
+                || matches!(self.actual_backend, RenderGpuBackend::Auto)
+                || matches!(self.requested_backend, RenderGpuBackend::Auto))
+        {
             self.requested_backend = other.requested_backend;
             self.actual_backend = other.actual_backend;
             self.adapter_name.clone_from(&other.adapter_name);
@@ -2825,27 +2855,41 @@ impl RenderPipelineStats {
             .saturating_add(stats.cache_validation_mismatches);
         self.cache_read_ms = self.cache_read_ms.saturating_add(stats.cache_read_ms);
         self.cache_decode_ms = self.cache_decode_ms.saturating_add(stats.cache_decode_ms);
+        self.tile_blob_decode_ms = self
+            .tile_blob_decode_ms
+            .saturating_add(stats.tile_blob_decode_ms);
         self.region_cache_hits = self
             .region_cache_hits
             .saturating_add(stats.region_cache_hits);
         self.region_cache_misses = self
             .region_cache_misses
             .saturating_add(stats.region_cache_misses);
-        self.chunk_bake_cache_hits = self
-            .chunk_bake_cache_hits
-            .saturating_add(stats.chunk_bake_cache_hits);
-        self.chunk_bake_cache_misses = self
-            .chunk_bake_cache_misses
-            .saturating_add(stats.chunk_bake_cache_misses);
-        self.chunk_bake_cache_memory_hits = self
-            .chunk_bake_cache_memory_hits
-            .saturating_add(stats.chunk_bake_cache_memory_hits);
-        self.chunk_bake_cache_disk_hits = self
-            .chunk_bake_cache_disk_hits
-            .saturating_add(stats.chunk_bake_cache_disk_hits);
-        self.chunk_bake_cache_writes = self
-            .chunk_bake_cache_writes
-            .saturating_add(stats.chunk_bake_cache_writes);
+        self.tile_index_trusted_hits = self
+            .tile_index_trusted_hits
+            .saturating_add(stats.tile_index_trusted_hits);
+        self.tile_index_validated_hits = self
+            .tile_index_validated_hits
+            .saturating_add(stats.tile_index_validated_hits);
+        self.tile_index_misses = self
+            .tile_index_misses
+            .saturating_add(stats.tile_index_misses);
+        self.tile_index_empty_hits = self
+            .tile_index_empty_hits
+            .saturating_add(stats.tile_index_empty_hits);
+        self.tile_index_read_ms = self
+            .tile_index_read_ms
+            .saturating_add(stats.tile_index_read_ms);
+        self.tile_dep_validation_ms = self
+            .tile_dep_validation_ms
+            .saturating_add(stats.tile_dep_validation_ms);
+        self.tile_cache_writer_dropped = self
+            .tile_cache_writer_dropped
+            .saturating_add(stats.tile_cache_writer_dropped);
+        self.world_signature_trusted |= stats.world_signature_trusted;
+        self.world_signature_changed |= stats.world_signature_changed;
+        self.index_corrupt_misses = self
+            .index_corrupt_misses
+            .saturating_add(stats.index_corrupt_misses);
         self.bake_ms = self.bake_ms.saturating_add(stats.bake_ms);
         self.world_load_ms = self.world_load_ms.saturating_add(stats.world_load_ms);
         self.region_bake_ms = self.region_bake_ms.saturating_add(stats.region_bake_ms);
@@ -2938,14 +2982,14 @@ impl RenderPipelineStats {
     fn add_gpu_diagnostics(&mut self, diagnostics: RenderGpuDiagnostics) {
         if diagnostics.tiles != 0 {
             self.gpu_tiles = self.gpu_tiles.saturating_add(diagnostics.tiles);
-        }
-        self.gpu_requested_backend = diagnostics.requested_backend;
-        self.gpu_actual_backend = diagnostics.actual_backend;
-        if diagnostics.adapter_name.is_some() {
-            self.gpu_adapter_name = diagnostics.adapter_name;
-        }
-        if diagnostics.device_name.is_some() {
-            self.gpu_device_name = diagnostics.device_name;
+            self.gpu_requested_backend = diagnostics.requested_backend;
+            self.gpu_actual_backend = diagnostics.actual_backend;
+            if diagnostics.adapter_name.is_some() {
+                self.gpu_adapter_name = diagnostics.adapter_name;
+            }
+            if diagnostics.device_name.is_some() {
+                self.gpu_device_name = diagnostics.device_name;
+            }
         }
         if diagnostics.fallback_reason.is_some() {
             self.gpu_fallback_reason = diagnostics.fallback_reason;
@@ -2994,18 +3038,6 @@ impl RenderPipelineStats {
         self.full_reload_ms = self.full_reload_ms.saturating_add(stats.full_reload_ms);
         self.world_worker_threads = self.world_worker_threads.max(stats.worker_threads);
         self.cpu_queue_wait_ms = self.cpu_queue_wait_ms.saturating_add(stats.queue_wait_ms);
-    }
-
-    fn add_chunk_bake_cache_stats(&mut self, stats: ChunkBakeCacheStats) {
-        self.chunk_bake_cache_hits = self.chunk_bake_cache_hits.saturating_add(stats.hits);
-        self.chunk_bake_cache_misses = self.chunk_bake_cache_misses.saturating_add(stats.misses);
-        self.chunk_bake_cache_memory_hits = self
-            .chunk_bake_cache_memory_hits
-            .saturating_add(stats.memory_hits);
-        self.chunk_bake_cache_disk_hits = self
-            .chunk_bake_cache_disk_hits
-            .saturating_add(stats.disk_hits);
-        self.chunk_bake_cache_writes = self.chunk_bake_cache_writes.saturating_add(stats.writes);
     }
 }
 
@@ -3303,11 +3335,9 @@ pub fn tile_cache_validation_value(
     fnv1a_write_i32(&mut hash, region.max_chunk_x);
     fnv1a_write_i32(&mut hash, region.max_chunk_z);
 
-    let mut positions = chunk_positions.to_vec();
-    positions.sort();
-    positions.dedup();
+    let positions = canonical_chunk_positions(chunk_positions);
     fnv1a_write_u64(&mut hash, positions.len() as u64);
-    for pos in positions {
+    for pos in positions.iter() {
         fnv1a_write_i32(&mut hash, pos.dimension.id());
         fnv1a_write_i32(&mut hash, pos.x);
         fnv1a_write_i32(&mut hash, pos.z);
@@ -3315,73 +3345,17 @@ pub fn tile_cache_validation_value(
     hash
 }
 
-/// Cache key for persistent chunk-bake sidecar entries.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ChunkBakeCacheKey {
-    /// Stable world identifier.
-    pub world_id: String,
-    /// World content signature.
-    pub world_signature: String,
-    /// Renderer cache schema version.
-    pub renderer_version: u32,
-    /// Palette data version.
-    pub palette_version: u32,
-    /// Bedrock dimension.
-    pub dimension: Dimension,
-    /// Render mode slug.
-    pub mode: String,
-    /// Surface option hash.
-    pub surface_hash: u64,
-    /// Chunk X coordinate.
-    pub chunk_x: i32,
-    /// Chunk Z coordinate.
-    pub chunk_z: i32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChunkBakeCacheHit {
-    Memory,
-    Disk,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ChunkBakeCacheStats {
-    hits: usize,
-    misses: usize,
-    memory_hits: usize,
-    disk_hits: usize,
-    writes: usize,
-}
-
-impl ChunkBakeCacheStats {
-    fn record_hit(&mut self, hit: ChunkBakeCacheHit) {
-        self.hits = self.hits.saturating_add(1);
-        match hit {
-            ChunkBakeCacheHit::Memory => {
-                self.memory_hits = self.memory_hits.saturating_add(1);
-            }
-            ChunkBakeCacheHit::Disk => {
-                self.disk_hits = self.disk_hits.saturating_add(1);
-            }
-        }
+fn canonical_chunk_positions(chunk_positions: &[ChunkPos]) -> Cow<'_, [ChunkPos]> {
+    if chunk_positions
+        .windows(2)
+        .all(|window| window[0] < window[1])
+    {
+        return Cow::Borrowed(chunk_positions);
     }
-
-    fn record_miss(&mut self) {
-        self.misses = self.misses.saturating_add(1);
-    }
-}
-
-/// Memory and sidecar-disk cache for baked chunk render payloads.
-#[derive(Debug)]
-pub struct ChunkBakeCache {
-    root: PathBuf,
-    memory_limit: usize,
-    memory_order: VecDeque<ChunkBakeCacheKey>,
-    memory: BTreeMap<ChunkBakeCacheKey, ChunkBake>,
-    world_id: String,
-    world_signature: String,
-    renderer_version: u32,
-    palette_version: u32,
+    let mut positions = chunk_positions.to_vec();
+    positions.sort();
+    positions.dedup();
+    Cow::Owned(positions)
 }
 
 #[derive(Debug)]
@@ -3391,130 +3365,6 @@ struct RegionBakeMemoryCache {
     memory: BTreeMap<RegionBakeCacheKey, RegionBake>,
     renderer_version: u32,
     palette_version: u32,
-}
-
-impl ChunkBakeCache {
-    /// Creates a chunk-bake cache rooted at a filesystem path.
-    #[must_use]
-    pub fn new(
-        root: impl Into<PathBuf>,
-        memory_limit: usize,
-        world_id: impl Into<String>,
-        world_signature: impl Into<String>,
-        renderer_version: u32,
-        palette_version: u32,
-    ) -> Self {
-        Self {
-            root: root.into(),
-            memory_limit: memory_limit.max(1),
-            memory_order: VecDeque::new(),
-            memory: BTreeMap::new(),
-            world_id: world_id.into(),
-            world_signature: world_signature.into(),
-            renderer_version,
-            palette_version,
-        }
-    }
-
-    fn key_for(
-        &self,
-        pos: ChunkPos,
-        mode: RenderMode,
-        surface: SurfaceRenderOptions,
-    ) -> ChunkBakeCacheKey {
-        ChunkBakeCacheKey {
-            world_id: self.world_id.clone(),
-            world_signature: self.world_signature.clone(),
-            renderer_version: self.renderer_version,
-            palette_version: self.palette_version,
-            dimension: pos.dimension,
-            mode: mode_slug(mode),
-            surface_hash: surface_options_hash(surface),
-            chunk_x: pos.x,
-            chunk_z: pos.z,
-        }
-    }
-
-    fn get(
-        &mut self,
-        pos: ChunkPos,
-        mode: RenderMode,
-        surface: SurfaceRenderOptions,
-        policy: RenderSidecarCachePolicy,
-    ) -> Option<(ChunkBake, ChunkBakeCacheHit)> {
-        let key = self.key_for(pos, mode, surface);
-        if let Some(bake) = self.memory.get(&key).cloned() {
-            return Some((bake, ChunkBakeCacheHit::Memory));
-        }
-        if !policy.writes_disk() {
-            return None;
-        }
-        let bake = self.read_disk(&key)?;
-        self.insert_memory(key, bake.clone());
-        Some((bake, ChunkBakeCacheHit::Disk))
-    }
-
-    fn insert(
-        &mut self,
-        bake: ChunkBake,
-        surface: SurfaceRenderOptions,
-        policy: RenderSidecarCachePolicy,
-    ) -> Result<()> {
-        let key = self.key_for(bake.pos, bake.mode, surface);
-        self.insert_memory(key.clone(), bake.clone());
-        if policy.writes_disk() {
-            self.write_disk(&key, &bake)?;
-        }
-        Ok(())
-    }
-
-    fn insert_memory(&mut self, key: ChunkBakeCacheKey, bake: ChunkBake) {
-        self.memory_order.push_back(key.clone());
-        self.memory.insert(key.clone(), bake);
-        while self.memory.len() > self.memory_limit {
-            let Some(old_key) = self.memory_order.pop_front() else {
-                break;
-            };
-            if old_key != key {
-                self.memory.remove(&old_key);
-            }
-        }
-    }
-
-    fn read_disk(&self, key: &ChunkBakeCacheKey) -> Option<ChunkBake> {
-        let bytes = fs::read(self.path_for_key(key)).ok()?;
-        decode_chunk_bake(&bytes, key).ok()
-    }
-
-    fn write_disk(&self, key: &ChunkBakeCacheKey, bake: &ChunkBake) -> Result<()> {
-        let path = self.path_for_key(key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                BedrockRenderError::io("failed to create chunk bake cache directory", error)
-            })?;
-        }
-        fs::write(path, encode_chunk_bake(bake)).map_err(|error| {
-            BedrockRenderError::io("failed to write chunk bake sidecar cache", error)
-        })
-    }
-
-    /// Returns the full disk-cache path for a chunk-bake key.
-    #[must_use]
-    pub fn path_for_key(&self, key: &ChunkBakeCacheKey) -> PathBuf {
-        self.root
-            .join("chunk-bakes")
-            .join(&key.world_id)
-            .join(&key.world_signature)
-            .join(format!(
-                "r{}-p{}-b{}",
-                key.renderer_version, key.palette_version, CHUNK_BAKE_CACHE_VERSION
-            ))
-            .join(dimension_slug(key.dimension))
-            .join(&key.mode)
-            .join(format!("{:016x}", key.surface_hash))
-            .join(key.chunk_x.to_string())
-            .join(format!("{}.brchunk", key.chunk_z))
-    }
 }
 
 impl RegionBakeMemoryCache {
@@ -3558,255 +3408,11 @@ impl RegionBakeMemoryCache {
     }
 }
 
-fn encode_chunk_bake(bake: &ChunkBake) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"BRCB1");
-    encode_chunk_bake_payload(&mut bytes, &bake.payload);
-    bytes
-}
-
-fn decode_chunk_bake(bytes: &[u8], key: &ChunkBakeCacheKey) -> Result<ChunkBake> {
-    let mut reader = ByteReader::new(bytes);
-    reader.expect_magic(b"BRCB1")?;
-    let payload = decode_chunk_bake_payload(&mut reader)?;
-    Ok(ChunkBake {
-        pos: ChunkPos {
-            x: key.chunk_x,
-            z: key.chunk_z,
-            dimension: key.dimension,
-        },
-        mode: mode_from_slug(&key.mode).ok_or_else(|| {
-            BedrockRenderError::Validation(format!(
-                "invalid chunk bake cache render mode slug {}",
-                key.mode
-            ))
-        })?,
-        payload,
-        diagnostics: RenderDiagnostics::default(),
-    })
-}
-
-fn encode_chunk_bake_payload(bytes: &mut Vec<u8>, payload: &ChunkBakePayload) {
-    match payload {
-        ChunkBakePayload::Colors(colors) => {
-            push_u8(bytes, 0);
-            encode_rgba_plane(bytes, colors);
-        }
-        ChunkBakePayload::Surface(surface) => {
-            push_u8(bytes, 1);
-            encode_rgba_plane(bytes, &surface.colors);
-            encode_height_plane(bytes, &surface.heights);
-            encode_height_plane(bytes, &surface.relief_heights);
-            encode_depth_plane(bytes, &surface.water_depths);
-        }
-        ChunkBakePayload::SurfaceAtlas(surface) => {
-            push_u8(bytes, 3);
-            encode_rgba_plane(bytes, &surface.colors);
-            encode_height_plane(bytes, &surface.heights);
-            encode_height_plane(bytes, &surface.relief_heights);
-            encode_depth_plane(bytes, &surface.water_depths);
-            encode_depth_plane(bytes, &surface.materials);
-            encode_depth_plane(bytes, &surface.shape_flags);
-            encode_depth_plane(bytes, &surface.overlay_alpha);
-        }
-        ChunkBakePayload::HeightMap { colors, heights } => {
-            push_u8(bytes, 2);
-            encode_rgba_plane(bytes, colors);
-            encode_height_plane(bytes, heights);
-        }
-    }
-}
-
-fn decode_chunk_bake_payload(reader: &mut ByteReader<'_>) -> Result<ChunkBakePayload> {
-    match reader.u8()? {
-        0 => Ok(ChunkBakePayload::Colors(decode_rgba_plane(reader)?)),
-        1 => Ok(ChunkBakePayload::Surface(SurfacePlane {
-            colors: decode_rgba_plane(reader)?,
-            heights: decode_height_plane(reader)?,
-            relief_heights: decode_height_plane(reader)?,
-            water_depths: decode_depth_plane(reader)?,
-        })),
-        2 => Ok(ChunkBakePayload::HeightMap {
-            colors: decode_rgba_plane(reader)?,
-            heights: decode_height_plane(reader)?,
-        }),
-        3 => Ok(ChunkBakePayload::SurfaceAtlas(SurfacePlaneAtlas {
-            colors: decode_rgba_plane(reader)?,
-            heights: decode_height_plane(reader)?,
-            relief_heights: decode_height_plane(reader)?,
-            water_depths: decode_depth_plane(reader)?,
-            materials: decode_depth_plane(reader)?,
-            shape_flags: decode_depth_plane(reader)?,
-            overlay_alpha: decode_depth_plane(reader)?,
-        })),
-        tag => Err(BedrockRenderError::Validation(format!(
-            "invalid chunk bake cache payload tag {tag}"
-        ))),
-    }
-}
-
-fn encode_rgba_plane(bytes: &mut Vec<u8>, plane: &RgbaPlane) {
-    push_u32(bytes, plane.width);
-    push_u32(bytes, plane.height);
-    push_u32(bytes, u32::try_from(plane.pixels.len()).unwrap_or(u32::MAX));
-    for color in &plane.pixels {
-        push_u8(bytes, color.red);
-        push_u8(bytes, color.green);
-        push_u8(bytes, color.blue);
-        push_u8(bytes, color.alpha);
-    }
-}
-
-fn decode_rgba_plane(reader: &mut ByteReader<'_>) -> Result<RgbaPlane> {
-    let width = reader.u32()?;
-    let height = reader.u32()?;
-    let len = usize::try_from(reader.u32()?).map_err(|_| {
-        BedrockRenderError::Validation("chunk bake cache plane length overflow".to_string())
-    })?;
-    if len != plane_len(width, height)? {
-        return Err(BedrockRenderError::Validation(
-            "chunk bake cache rgba plane length mismatch".to_string(),
-        ));
-    }
-    let mut pixels = Vec::with_capacity(len);
-    for _ in 0..len {
-        pixels.push(RgbaColor::new(
-            reader.u8()?,
-            reader.u8()?,
-            reader.u8()?,
-            reader.u8()?,
-        ));
-    }
-    Ok(RgbaPlane {
-        width,
-        height,
-        pixels,
-    })
-}
-
-fn encode_height_plane(bytes: &mut Vec<u8>, plane: &HeightPlane) {
-    push_u32(bytes, plane.width);
-    push_u32(bytes, plane.height);
-    push_u32(
-        bytes,
-        u32::try_from(plane.heights.len()).unwrap_or(u32::MAX),
-    );
-    for height in &plane.heights {
-        push_i16(bytes, *height);
-    }
-}
-
-fn decode_height_plane(reader: &mut ByteReader<'_>) -> Result<HeightPlane> {
-    let width = reader.u32()?;
-    let height = reader.u32()?;
-    let len = usize::try_from(reader.u32()?).map_err(|_| {
-        BedrockRenderError::Validation("chunk bake cache plane length overflow".to_string())
-    })?;
-    if len != plane_len(width, height)? {
-        return Err(BedrockRenderError::Validation(
-            "chunk bake cache height plane length mismatch".to_string(),
-        ));
-    }
-    let mut heights = Vec::with_capacity(len);
-    for _ in 0..len {
-        heights.push(reader.i16()?);
-    }
-    Ok(HeightPlane {
-        width,
-        height,
-        heights,
-    })
-}
-
-fn encode_depth_plane(bytes: &mut Vec<u8>, plane: &DepthPlane) {
-    push_u32(bytes, plane.width);
-    push_u32(bytes, plane.height);
-    push_u32(bytes, u32::try_from(plane.depths.len()).unwrap_or(u32::MAX));
-    bytes.extend_from_slice(&plane.depths);
-}
-
-fn decode_depth_plane(reader: &mut ByteReader<'_>) -> Result<DepthPlane> {
-    let width = reader.u32()?;
-    let height = reader.u32()?;
-    let len = usize::try_from(reader.u32()?).map_err(|_| {
-        BedrockRenderError::Validation("chunk bake cache plane length overflow".to_string())
-    })?;
-    if len != plane_len(width, height)? {
-        return Err(BedrockRenderError::Validation(
-            "chunk bake cache depth plane length mismatch".to_string(),
-        ));
-    }
-    let depths = reader.bytes(len)?.to_vec();
-    Ok(DepthPlane {
-        width,
-        height,
-        depths,
-    })
-}
-
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> ByteReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn expect_magic(&mut self, magic: &[u8]) -> Result<()> {
-        let value = self.bytes(magic.len())?;
-        if value == magic {
-            Ok(())
-        } else {
-            Err(BedrockRenderError::Validation(
-                "invalid chunk bake cache magic".to_string(),
-            ))
-        }
-    }
-
-    fn bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self.offset.checked_add(len).ok_or_else(|| {
-            BedrockRenderError::Validation("chunk bake cache offset overflow".to_string())
-        })?;
-        let slice = self.bytes.get(self.offset..end).ok_or_else(|| {
-            BedrockRenderError::Validation("truncated chunk bake cache entry".to_string())
-        })?;
-        self.offset = end;
-        Ok(slice)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.bytes(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32> {
-        let bytes = self.bytes(4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn i16(&mut self) -> Result<i16> {
-        let bytes = self.bytes(2)?;
-        Ok(i16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-}
-
-fn push_u8(bytes: &mut Vec<u8>, value: u8) {
-    bytes.push(value);
-}
-
-fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_i16(bytes: &mut Vec<u8>, value: i16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
 /// Small memory and disk cache for rendered tiles.
 #[derive(Debug)]
 pub struct TileCache {
     root: PathBuf,
+    authority: TileAuthorityCache,
     memory_limit: usize,
     memory_order: VecDeque<TileCacheKey>,
     memory: BTreeMap<TileCacheKey, TileImage>,
@@ -3814,22 +3420,160 @@ pub struct TileCache {
 
 struct TileCacheWrite {
     key: TileCacheKey,
-    encoded: Vec<u8>,
+    payload: TileCacheWritePayload,
 }
 
-type TileCacheWriteSender = Arc<Mutex<mpsc::Sender<TileCacheWrite>>>;
+enum TileCacheDiskRead {
+    Hit(Vec<u8>),
+    Miss,
+    Corrupt,
+}
 
-struct TileCacheWriter {
-    sender: TileCacheWriteSender,
-    handle: thread::JoinHandle<()>,
+enum TileCacheWritePayload {
+    FastRgbaZstd {
+        rgba: Arc<[u8]>,
+        width: u32,
+        height: u32,
+        region: ChunkRegion,
+        chunk_positions: Arc<[ChunkPos]>,
+        validation_seed: u64,
+        flags: u32,
+    },
+    EmptyNegative {
+        tile_size: u32,
+        region: ChunkRegion,
+        validation_seed: u64,
+    },
+}
+
+struct PreparedTileCacheCommit {
+    authority_key: TileAuthorityCacheKey,
+    commit: TileAuthorityCommit,
+}
+
+#[derive(Clone)]
+enum TileAuthoritySnapshotState {
+    Ready(Arc<TileAuthorityIndexSnapshot>),
+    Missing,
+    Corrupt,
+}
+
+type TileAuthoritySnapshotCache =
+    Arc<Mutex<BTreeMap<TileAuthorityCacheKey, TileAuthoritySnapshotState>>>;
+
+enum TileAuthorityBlobReaderState {
+    Ready(Arc<TileAuthorityBlobReader>),
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SessionTileMemoryKey {
+    cache_key: TileCacheKey,
+    validation_value: u64,
+    pixel_format: TilePixelFormat,
+}
+
+struct SessionTileMemoryIndex {
+    limit: usize,
+    order: VecDeque<SessionTileMemoryKey>,
+    entries: BTreeMap<SessionTileMemoryKey, TileImage>,
+}
+
+impl SessionTileMemoryIndex {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            order: VecDeque::new(),
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &SessionTileMemoryKey) -> Option<TileImage> {
+        let tile = self.entries.get(key).cloned()?;
+        self.order.retain(|existing| existing != key);
+        self.order.push_back(key.clone());
+        Some(tile)
+    }
+
+    fn insert(&mut self, key: SessionTileMemoryKey, tile: TileImage) {
+        self.order.retain(|existing| existing != &key);
+        self.order.push_back(key.clone());
+        self.entries.insert(key.clone(), tile);
+        while self.entries.len() > self.limit {
+            let Some(old_key) = self.order.pop_front() else {
+                break;
+            };
+            if old_key != key {
+                self.entries.remove(&old_key);
+            }
+        }
+    }
+}
+
+fn session_tile_memory_key(
+    cache_key: &TileCacheKey,
+    planned: &PlannedTile,
+    validation_seed: u64,
+) -> Option<SessionTileMemoryKey> {
+    let chunk_positions = planned.chunk_positions.as_deref()?;
+    Some(SessionTileMemoryKey {
+        cache_key: cache_key.clone(),
+        validation_value: tile_cache_validation_value(
+            cache_key,
+            &planned.region,
+            chunk_positions,
+            validation_seed,
+        ),
+        pixel_format: TilePixelFormat::Rgba8,
+    })
+}
+
+#[derive(Clone)]
+struct TileCacheWriterPool {
+    inner: Arc<TileCacheWriterPoolInner>,
+}
+
+struct TileCacheWriterPoolInner {
+    sender: Mutex<Option<crossbeam_channel::Sender<TileCacheWrite>>>,
+    encode_handles: Mutex<Vec<thread::JoinHandle<()>>>,
+    commit_handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TileCacheWriteQueueResult {
+    Queued,
+    Dropped,
+}
+
+impl Drop for TileCacheWriterPoolInner {
+    fn drop(&mut self) {
+        if let Ok(sender) = self.sender.get_mut() {
+            sender.take();
+        }
+        if let Ok(handles) = self.encode_handles.get_mut() {
+            for handle in handles.drain(..) {
+                if handle.join().is_err() {
+                    log::warn!("tile cache encode worker thread panicked");
+                }
+            }
+        }
+        if let Ok(handle) = self.commit_handle.get_mut()
+            && let Some(handle) = handle.take()
+            && handle.join().is_err()
+        {
+            log::warn!("tile cache commit thread panicked");
+        }
+    }
 }
 
 impl TileCache {
     /// Creates a tile cache rooted at a filesystem path.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>, memory_limit: usize) -> Self {
+        let root = root.into();
         Self {
-            root: root.into(),
+            authority: TileAuthorityCache::new(root.clone()),
+            root,
             memory_limit: memory_limit.max(1),
             memory_order: VecDeque::new(),
             memory: BTreeMap::new(),
@@ -3842,10 +3586,55 @@ impl TileCache {
         self.memory.get(key).cloned()
     }
 
-    /// Reads encoded tile bytes from disk, if present.
-    #[must_use]
-    pub fn get_disk(&self, key: &TileCacheKey) -> Option<Vec<u8>> {
-        fs::read(self.path_for_key(key)).ok()
+    fn load_authority_snapshot(
+        &self,
+        authority_key: &TileAuthorityCacheKey,
+    ) -> Result<Option<Arc<TileAuthorityIndexSnapshot>>> {
+        self.authority
+            .load_index(authority_key)
+            .map(|snapshot| snapshot.map(Arc::new))
+    }
+
+    fn get_disk_with_snapshot(
+        &self,
+        key: &TileCacheKey,
+        authority_key: &TileAuthorityCacheKey,
+        snapshot: Option<&TileAuthorityIndexSnapshot>,
+        blob_reader: Option<&TileAuthorityBlobReader>,
+        blob_reader_known_missing: bool,
+    ) -> TileCacheDiskRead {
+        let Some(snapshot) = snapshot else {
+            return TileCacheDiskRead::Miss;
+        };
+        let Some(entry) = snapshot.tile(key.tile_x, key.tile_z) else {
+            return TileCacheDiskRead::Miss;
+        };
+        if entry.is_empty() {
+            return match encode_fast_rgba_zstd_empty_negative(
+                entry.width,
+                entry.height,
+                entry.validation_value,
+            ) {
+                Ok(encoded) => TileCacheDiskRead::Hit(encoded),
+                Err(error) => {
+                    log::debug!("tile authority empty entry rejected: {error}");
+                    TileCacheDiskRead::Corrupt
+                }
+            };
+        }
+        let blob = match blob_reader {
+            Some(reader) => reader.read_entry(entry),
+            None if blob_reader_known_missing => return TileCacheDiskRead::Corrupt,
+            None => self.authority.read_blob(authority_key, entry),
+        };
+        match blob {
+            Ok(Some(blob)) => TileCacheDiskRead::Hit(blob),
+            Ok(None) => TileCacheDiskRead::Corrupt,
+            Err(error) => {
+                log::debug!("tile authority blob rejected: {error}");
+                TileCacheDiskRead::Corrupt
+            }
+        }
     }
 
     /// Inserts a tile into memory and writes encoded bytes to disk when present.
@@ -3884,135 +3673,372 @@ impl TileCache {
     ///
     /// Returns an error if the cache directory cannot be created or the file cannot be written.
     pub fn write_encoded(&self, key: &TileCacheKey, encoded: &[u8]) -> Result<()> {
-        let path = self.path_for_key(key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                BedrockRenderError::io("failed to create tile cache directory", error)
-            })?;
-        }
-        write_encoded_tile_atomic(&path, encoded)
+        self.write_fast_rgba_zstd_entry(key, encoded, None, None, 0)
     }
 
-    /// Returns the full disk-cache path for a tile key.
+    fn write_fast_rgba_zstd_entry(
+        &self,
+        key: &TileCacheKey,
+        encoded: &[u8],
+        region: Option<ChunkRegion>,
+        chunk_positions: Option<&[ChunkPos]>,
+        validation_seed: u64,
+    ) -> Result<()> {
+        let commit =
+            prepare_fast_rgba_zstd_commit(key, encoded, region, chunk_positions, validation_seed)?;
+        self.commit_prepared_tile_cache_commits(vec![commit])
+            .map(|_| ())
+    }
+
+    fn commit_prepared_tile_cache_commits(
+        &self,
+        commits: Vec<PreparedTileCacheCommit>,
+    ) -> Result<Vec<(TileAuthorityCacheKey, TileAuthorityIndexSnapshot)>> {
+        let mut commits_by_key = BTreeMap::<TileAuthorityCacheKey, Vec<TileAuthorityCommit>>::new();
+        for commit in commits {
+            commits_by_key
+                .entry(commit.authority_key)
+                .or_default()
+                .push(commit.commit);
+        }
+        let mut committed_snapshots = Vec::with_capacity(commits_by_key.len());
+        for (authority_key, commits) in commits_by_key {
+            let previous = match self.authority.load_index(&authority_key) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    log::debug!("tile authority index ignored while writing new tile: {error}");
+                    None
+                }
+            };
+            let snapshot =
+                self.authority
+                    .commit_tiles(&authority_key, previous.as_ref(), commits, false)?;
+            committed_snapshots.push((authority_key, snapshot));
+        }
+        Ok(committed_snapshots)
+    }
+
+    /// Returns the root authority-cache directory for a tile key.
     #[must_use]
     pub fn path_for_key(&self, key: &TileCacheKey) -> PathBuf {
-        self.root
-            .join("web-tiles")
-            .join(&key.world_id)
-            .join(&key.world_signature)
-            .join(format!(
-                "r{}-p{}",
-                key.renderer_version, key.palette_version
-            ))
-            .join(dimension_slug(key.dimension))
-            .join(&key.mode)
-            .join(format!(
-                "{}c-{}bpp-{}ppb",
-                key.chunks_per_tile, key.blocks_per_pixel, key.pixels_per_block
-            ))
-            .join(key.tile_x.to_string())
-            .join(format!("{}.{}", key.tile_z, key.extension))
+        tile_authority_cache_key_from_tile_key(key).root_for_cache_root(&self.root)
     }
 }
 
-fn write_encoded_tile_atomic(path: &Path, encoded: &[u8]) -> Result<()> {
-    let temp_path = tile_cache_temp_path(path);
-    fs::write(&temp_path, encoded)
-        .map_err(|error| BedrockRenderError::io("failed to write temporary tile cache", error))?;
-    match fs::rename(&temp_path, path) {
-        Ok(()) => Ok(()),
-        Err(rename_error) if path.exists() => {
-            fs::remove_file(path).map_err(|remove_error| {
-                cleanup_temp_tile_cache(&temp_path);
-                BedrockRenderError::io(
-                    format!("failed to replace tile cache after rename error: {rename_error}"),
-                    remove_error,
-                )
-            })?;
-            fs::rename(&temp_path, path).map_err(|error| {
-                cleanup_temp_tile_cache(&temp_path);
-                BedrockRenderError::io("failed to replace encoded tile cache", error)
-            })
-        }
-        Err(error) => {
-            cleanup_temp_tile_cache(&temp_path);
-            Err(BedrockRenderError::io(
-                "failed to move temporary tile cache into place",
-                error,
-            ))
-        }
+fn tile_authority_cache_key_from_tile_key(key: &TileCacheKey) -> TileAuthorityCacheKey {
+    TileAuthorityCacheKey {
+        world_id: key.world_id.clone(),
+        world_signature: key.world_signature.clone(),
+        renderer_signature: key.world_signature.clone(),
+        mode_slug: key.mode.clone(),
+        renderer_version: key.renderer_version,
+        palette_version: key.palette_version,
+        dimension: key.dimension,
+        chunks_per_tile: key.chunks_per_tile,
+        blocks_per_pixel: key.blocks_per_pixel,
+        pixels_per_block: key.pixels_per_block,
     }
 }
 
-fn tile_cache_temp_path(path: &Path) -> PathBuf {
-    let write_id = TILE_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("tile-cache");
-    path.with_file_name(format!(
-        "{file_name}.{}.{}.tmp",
-        std::process::id(),
-        write_id
-    ))
-}
+fn load_tile_authority_snapshots_for_batch(
+    cache: &Arc<Mutex<TileCache>>,
+    snapshot_cache: &TileAuthoritySnapshotCache,
+    cache_keys: impl IntoIterator<Item = TileCacheKey>,
+) -> Result<BTreeMap<TileAuthorityCacheKey, TileAuthoritySnapshotState>> {
+    let mut authority_keys = cache_keys
+        .into_iter()
+        .map(|key| tile_authority_cache_key_from_tile_key(&key))
+        .collect::<Vec<_>>();
+    authority_keys.sort();
+    authority_keys.dedup();
 
-fn cleanup_temp_tile_cache(path: &Path) {
-    if let Err(error) = fs::remove_file(path) {
-        log::warn!(
-            "failed to remove temporary tile cache file {}: {error}",
-            path.display()
-        );
-    }
-}
-
-fn spawn_tile_cache_writer(cache: Arc<Mutex<TileCache>>) -> Option<TileCacheWriter> {
-    let (sender, receiver) = mpsc::channel::<TileCacheWrite>();
-    match thread::Builder::new()
-        .name("bedrock-render-tile-cache-writer".to_string())
-        .spawn(move || {
-            for write in receiver {
-                let tile_x = write.key.tile_x;
-                let tile_z = write.key.tile_z;
-                let dimension = write.key.dimension;
-                let cache = match cache.lock() {
-                    Ok(cache) => cache,
-                    Err(_) => {
-                        log::warn!("tile cache lock was poisoned while writing asynchronously");
-                        continue;
-                    }
-                };
-                if let Err(error) = cache.write_encoded(&write.key, &write.encoded) {
-                    log::warn!(
-                        "tile cache write failed (dimension={:?}, tile=({}, {}), error={})",
-                        dimension,
-                        tile_x,
-                        tile_z,
-                        error
-                    );
-                } else {
-                    log::trace!(
-                        "tile cache write complete (dimension={:?}, tile=({}, {}), bytes={})",
-                        dimension,
-                        tile_x,
-                        tile_z,
-                        write.encoded.len()
-                    );
-                }
+    let mut loaded = BTreeMap::new();
+    let mut missing = Vec::new();
+    if let Ok(snapshots) = snapshot_cache.lock() {
+        for key in authority_keys {
+            if let Some(snapshot) = snapshots.get(&key) {
+                loaded.insert(key, snapshot.clone());
+            } else {
+                missing.push(key);
             }
-        }) {
-        Ok(handle) => Some(TileCacheWriter {
-            sender: Arc::new(Mutex::new(sender)),
-            handle,
-        }),
-        Err(error) => {
-            log::warn!("failed to start rendered tile cache writer: {error}");
-            None
+        }
+    } else {
+        missing = authority_keys;
+    }
+
+    if missing.is_empty() {
+        return Ok(loaded);
+    }
+
+    let cache = cache
+        .lock()
+        .map_err(|_| BedrockRenderError::Validation("tile cache lock was poisoned".to_string()))?;
+    let mut newly_loaded = Vec::with_capacity(missing.len());
+    for key in missing {
+        let snapshot = match cache.load_authority_snapshot(&key) {
+            Ok(Some(snapshot)) => TileAuthoritySnapshotState::Ready(snapshot),
+            Ok(None) => TileAuthoritySnapshotState::Missing,
+            Err(error) => {
+                log::debug!("tile authority index rejected: {error}");
+                TileAuthoritySnapshotState::Corrupt
+            }
+        };
+        newly_loaded.push((key, snapshot));
+    }
+    drop(cache);
+
+    if let Ok(mut snapshots) = snapshot_cache.lock() {
+        for (key, snapshot) in &newly_loaded {
+            snapshots.insert(key.clone(), snapshot.clone());
         }
     }
+    for (key, snapshot) in newly_loaded {
+        loaded.insert(key, snapshot);
+    }
+    Ok(loaded)
 }
 
-fn queue_tile_cache_write(writer: &Option<TileCacheWriter>, write: TileCacheWrite) {
+fn open_tile_authority_blob_readers_for_batch(
+    cache: &Arc<Mutex<TileCache>>,
+    snapshots: &BTreeMap<TileAuthorityCacheKey, TileAuthoritySnapshotState>,
+) -> Result<BTreeMap<TileAuthorityCacheKey, TileAuthorityBlobReaderState>> {
+    let authority = cache
+        .lock()
+        .map_err(|_| BedrockRenderError::Validation("tile cache lock was poisoned".to_string()))?
+        .authority
+        .clone();
+    let mut readers = BTreeMap::new();
+    for (key, snapshot) in snapshots {
+        if !matches!(snapshot, TileAuthoritySnapshotState::Ready(_)) {
+            continue;
+        }
+        match TileAuthorityBlobReader::open(&authority, key) {
+            Ok(Some(reader)) => {
+                readers.insert(
+                    key.clone(),
+                    TileAuthorityBlobReaderState::Ready(Arc::new(reader)),
+                );
+            }
+            Ok(None) => {
+                readers.insert(key.clone(), TileAuthorityBlobReaderState::Missing);
+            }
+            Err(error) => {
+                log::debug!("tile authority blob reader unavailable: {error}");
+                readers.insert(key.clone(), TileAuthorityBlobReaderState::Missing);
+            }
+        }
+    }
+    Ok(readers)
+}
+
+fn prepare_fast_rgba_zstd_commit(
+    key: &TileCacheKey,
+    encoded: &[u8],
+    region: Option<ChunkRegion>,
+    chunk_positions: Option<&[ChunkPos]>,
+    validation_seed: u64,
+) -> Result<PreparedTileCacheCommit> {
+    let authority_key = tile_authority_cache_key_from_tile_key(key);
+    let header = decode_fast_rgba_zstd_header(encoded)?;
+    let validation_value = header.validation_value.unwrap_or_else(|| {
+        region
+            .zip(chunk_positions)
+            .map_or(0, |(region, chunk_positions)| {
+                tile_cache_validation_value(key, &region, chunk_positions, validation_seed)
+            })
+    });
+    let flags = if header.is_empty_negative() {
+        TILE_AUTHORITY_FLAG_EMPTY
+    } else {
+        TILE_AUTHORITY_FLAG_NON_EMPTY
+    };
+    let commit = TileAuthorityCommit {
+        entry: TileAuthorityEntry {
+            tile_x: key.tile_x,
+            tile_z: key.tile_z,
+            width: header.width,
+            height: header.height,
+            pixel_len: header.rgba_len,
+            blob_offset: 0,
+            blob_len: if header.is_empty_negative() {
+                0
+            } else {
+                u64::try_from(encoded.len()).map_err(|_| {
+                    BedrockRenderError::Validation(
+                        "encoded tile length does not fit u64".to_string(),
+                    )
+                })?
+            },
+            validation_value,
+            flags,
+        },
+        encoded_blob: if header.is_empty_negative() {
+            Vec::new()
+        } else {
+            encoded.to_vec()
+        },
+        dependencies: tile_authority_dependencies_from_positions(
+            key,
+            region,
+            chunk_positions,
+            validation_seed,
+        ),
+        chunk_states: tile_authority_chunk_states_from_positions(
+            key,
+            region,
+            chunk_positions,
+            validation_seed,
+        ),
+        chunk_tile_refs: tile_authority_chunk_tile_refs_from_positions(key, chunk_positions),
+    };
+    Ok(PreparedTileCacheCommit {
+        authority_key,
+        commit,
+    })
+}
+
+fn tile_authority_dependencies_from_positions(
+    key: &TileCacheKey,
+    region: Option<ChunkRegion>,
+    chunk_positions: Option<&[ChunkPos]>,
+    validation_seed: u64,
+) -> Vec<TileAuthorityDependency> {
+    let Some(chunk_positions) = chunk_positions else {
+        return Vec::new();
+    };
+    let stamp = region.map_or(0, |region| {
+        tile_cache_validation_value(key, &region, chunk_positions, validation_seed)
+    });
+    canonical_chunk_positions(chunk_positions)
+        .iter()
+        .copied()
+        .map(|position| TileAuthorityDependency {
+            tile_x: key.tile_x,
+            tile_z: key.tile_z,
+            position,
+            revision: stamp,
+            content_hash: tile_authority_chunk_stamp(stamp, position),
+        })
+        .collect()
+}
+
+fn tile_authority_chunk_states_from_positions(
+    key: &TileCacheKey,
+    region: Option<ChunkRegion>,
+    chunk_positions: Option<&[ChunkPos]>,
+    validation_seed: u64,
+) -> Vec<TileAuthorityChunkState> {
+    let Some(chunk_positions) = chunk_positions else {
+        return Vec::new();
+    };
+    let stamp = region.map_or(0, |region| {
+        tile_cache_validation_value(key, &region, chunk_positions, validation_seed)
+    });
+    canonical_chunk_positions(chunk_positions)
+        .iter()
+        .copied()
+        .map(|position| TileAuthorityChunkState {
+            position,
+            revision: stamp,
+            content_hash: tile_authority_chunk_stamp(stamp, position),
+        })
+        .collect()
+}
+
+fn tile_authority_chunk_tile_refs_from_positions(
+    key: &TileCacheKey,
+    chunk_positions: Option<&[ChunkPos]>,
+) -> Vec<TileAuthorityChunkTileRef> {
+    let Some(chunk_positions) = chunk_positions else {
+        return Vec::new();
+    };
+    canonical_chunk_positions(chunk_positions)
+        .iter()
+        .copied()
+        .map(|position| TileAuthorityChunkTileRef {
+            position,
+            tile_x: key.tile_x,
+            tile_z: key.tile_z,
+        })
+        .collect()
+}
+
+fn tile_authority_chunk_stamp(seed: u64, position: ChunkPos) -> u64 {
+    let mut hash = if seed == 0 { FNV1A64_OFFSET } else { seed };
+    fnv1a_write_i32(&mut hash, position.dimension.id());
+    fnv1a_write_i32(&mut hash, position.x);
+    fnv1a_write_i32(&mut hash, position.z);
+    if hash == 0 { FNV1A64_OFFSET } else { hash }
+}
+
+fn spawn_tile_cache_writer(
+    cache: Arc<Mutex<TileCache>>,
+    authority_snapshots: TileAuthoritySnapshotCache,
+    options: &RenderOptions,
+    work_items: usize,
+) -> Option<TileCacheWriterPool> {
+    let work_items = work_items.max(64);
+    let worker_count = tile_cache_writer_worker_count(options, work_items);
+    let queue_capacity = tile_cache_writer_queue_capacity(options, work_items, worker_count);
+    let (sender, receiver) = crossbeam_channel::bounded::<TileCacheWrite>(queue_capacity);
+    let prepared_capacity = queue_capacity.max(worker_count.saturating_mul(2)).max(1);
+    let (prepared_sender, prepared_receiver) =
+        crossbeam_channel::bounded::<PreparedTileCacheCommit>(prepared_capacity);
+    let commit_cache = Arc::clone(&cache);
+    let commit_authority_snapshots = Arc::clone(&authority_snapshots);
+    let commit_handle = match thread::Builder::new()
+        .name("bedrock-render-tile-cache-commit".to_string())
+        .spawn(move || {
+            commit_tile_cache_entries(
+                &commit_cache,
+                &commit_authority_snapshots,
+                prepared_receiver,
+            );
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            log::warn!("failed to start rendered tile cache commit thread: {error}");
+            return None;
+        }
+    };
+    let mut encode_handles = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
+        let receiver = receiver.clone();
+        let prepared_sender = prepared_sender.clone();
+        let handle = match thread::Builder::new()
+            .name(format!("bedrock-render-tile-cache-encode-{worker_index}"))
+            .spawn(move || {
+                for write in &receiver {
+                    prepare_tile_cache_entry(&prepared_sender, write);
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::warn!(
+                    "failed to start rendered tile cache encode worker {worker_index}: {error}"
+                );
+                break;
+            }
+        };
+        encode_handles.push(handle);
+    }
+    drop(prepared_sender);
+    if encode_handles.is_empty() {
+        return None;
+    }
+    Some(TileCacheWriterPool {
+        inner: Arc::new(TileCacheWriterPoolInner {
+            sender: Mutex::new(Some(sender)),
+            encode_handles: Mutex::new(encode_handles),
+            commit_handle: Mutex::new(Some(commit_handle)),
+        }),
+    })
+}
+
+fn queue_tile_cache_write(
+    writer: &Option<TileCacheWriterPool>,
+    write: TileCacheWrite,
+) -> TileCacheWriteQueueResult {
     let Some(writer) = writer else {
         log::warn!(
             "tile cache writer unavailable (dimension={:?}, tile=({}, {}))",
@@ -4020,45 +4046,266 @@ fn queue_tile_cache_write(writer: &Option<TileCacheWriter>, write: TileCacheWrit
             write.key.tile_x,
             write.key.tile_z
         );
-        return;
+        return TileCacheWriteQueueResult::Dropped;
     };
     let tile_x = write.key.tile_x;
     let tile_z = write.key.tile_z;
     let dimension = write.key.dimension;
-    let bytes = write.encoded.len();
-    let sender = match writer.sender.lock() {
-        Ok(sender) => sender,
+    let sender = match writer.inner.sender.lock() {
+        Ok(sender) => sender.clone(),
         Err(_) => {
             log::warn!("tile cache writer sender lock was poisoned");
+            None
+        }
+    };
+    let Some(sender) = sender else {
+        log::debug!(
+            "tile cache writer already closed; dropping disk write (dimension={:?}, tile=({}, {}))",
+            dimension,
+            tile_x,
+            tile_z
+        );
+        return TileCacheWriteQueueResult::Dropped;
+    };
+    match sender.try_send(write) {
+        Ok(()) => {
+            log::trace!(
+                "tile cache write queued (dimension={:?}, tile=({}, {}))",
+                dimension,
+                tile_x,
+                tile_z
+            );
+            TileCacheWriteQueueResult::Queued
+        }
+        Err(crossbeam_channel::TrySendError::Full(write)) => {
+            log::debug!(
+                "tile cache write queue full; dropping disk write (dimension={:?}, tile=({}, {}))",
+                write.key.dimension,
+                write.key.tile_x,
+                write.key.tile_z
+            );
+            TileCacheWriteQueueResult::Dropped
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(write)) => {
+            log::warn!(
+                "tile cache writer disconnected (dimension={:?}, tile=({}, {}))",
+                write.key.dimension,
+                write.key.tile_x,
+                write.key.tile_z
+            );
+            TileCacheWriteQueueResult::Dropped
+        }
+    }
+}
+
+fn tile_cache_writer_worker_count(options: &RenderOptions, work_items: usize) -> usize {
+    let configured = options.cpu.encode_workers;
+    if configured >= 2 {
+        return configured.min(work_items.max(1)).max(1);
+    }
+    resolve_cpu_worker_count(options, work_items.max(1))
+        .map(|workers| workers.clamp(1, 4).min(work_items.max(1)))
+        .unwrap_or(1)
+}
+
+fn tile_cache_writer_queue_capacity(
+    options: &RenderOptions,
+    work_items: usize,
+    worker_count: usize,
+) -> usize {
+    options
+        .pipeline_depth
+        .max(worker_count.saturating_mul(2))
+        .max(work_items.min(64))
+        .max(1)
+}
+
+const TILE_CACHE_COMMIT_BATCH_SIZE: usize = 64;
+const TILE_CACHE_COMMIT_FLUSH_MS: u64 = 50;
+
+fn prepare_tile_cache_entry(
+    sender: &crossbeam_channel::Sender<PreparedTileCacheCommit>,
+    write: TileCacheWrite,
+) {
+    let tile_x = write.key.tile_x;
+    let tile_z = write.key.tile_z;
+    let dimension = write.key.dimension;
+    let encoded = match encode_tile_cache_write_payload(&write.key, &write.payload) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            log::warn!(
+                "tile cache encode failed (dimension={:?}, tile=({}, {}), error={})",
+                dimension,
+                tile_x,
+                tile_z,
+                error
+            );
             return;
         }
     };
-    if let Err(error) = sender.send(write) {
-        log::warn!(
-            "failed to queue rendered tile cache write (dimension={:?}, tile=({}, {}), error={})",
+    let prepared = match &write.payload {
+        TileCacheWritePayload::FastRgbaZstd {
+            region,
+            chunk_positions,
+            validation_seed,
+            ..
+        } => prepare_fast_rgba_zstd_commit(
+            &write.key,
+            &encoded,
+            Some(*region),
+            Some(chunk_positions.as_ref()),
+            *validation_seed,
+        ),
+        TileCacheWritePayload::EmptyNegative {
+            region,
+            validation_seed,
+            ..
+        } => prepare_fast_rgba_zstd_commit(
+            &write.key,
+            &encoded,
+            Some(*region),
+            Some(&[]),
+            *validation_seed,
+        ),
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log::warn!(
+                "tile cache commit prepare failed (dimension={:?}, tile=({}, {}), error={})",
+                dimension,
+                tile_x,
+                tile_z,
+                error
+            );
+            return;
+        }
+    };
+    if sender.send(prepared).is_err() {
+        log::debug!(
+            "tile cache commit receiver closed (dimension={:?}, tile=({}, {}), bytes={})",
             dimension,
             tile_x,
             tile_z,
-            error
+            encoded.len()
         );
     } else {
         log::trace!(
-            "tile cache write queued (dimension={:?}, tile=({}, {}), bytes={})",
+            "tile cache commit prepared (dimension={:?}, tile=({}, {}), bytes={})",
             dimension,
             tile_x,
             tile_z,
-            bytes
+            encoded.len()
         );
     }
 }
 
-fn flush_tile_cache_writer(writer: Option<TileCacheWriter>) {
-    let Some(writer) = writer else {
+fn commit_tile_cache_entries(
+    cache: &Arc<Mutex<TileCache>>,
+    authority_snapshots: &TileAuthoritySnapshotCache,
+    receiver: crossbeam_channel::Receiver<PreparedTileCacheCommit>,
+) {
+    let mut batch = Vec::with_capacity(TILE_CACHE_COMMIT_BATCH_SIZE);
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(TILE_CACHE_COMMIT_FLUSH_MS)) {
+            Ok(commit) => {
+                batch.push(commit);
+                while batch.len() < TILE_CACHE_COMMIT_BATCH_SIZE {
+                    match receiver.try_recv() {
+                        Ok(commit) => batch.push(commit),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            flush_tile_cache_commit_batch(cache, authority_snapshots, &mut batch);
+                            return;
+                        }
+                    }
+                }
+                if batch.len() >= TILE_CACHE_COMMIT_BATCH_SIZE {
+                    flush_tile_cache_commit_batch(cache, authority_snapshots, &mut batch);
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                flush_tile_cache_commit_batch(cache, authority_snapshots, &mut batch);
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                flush_tile_cache_commit_batch(cache, authority_snapshots, &mut batch);
+                return;
+            }
+        }
+    }
+}
+
+fn flush_tile_cache_commit_batch(
+    cache: &Arc<Mutex<TileCache>>,
+    authority_snapshots: &TileAuthoritySnapshotCache,
+    batch: &mut Vec<PreparedTileCacheCommit>,
+) {
+    if batch.is_empty() {
         return;
+    }
+    let commits = std::mem::take(batch);
+    let commit_count = commits.len();
+    let cache = match cache.lock() {
+        Ok(cache) => cache,
+        Err(_) => {
+            log::warn!("tile cache lock was poisoned while committing asynchronously");
+            return;
+        }
     };
-    drop(writer.sender);
-    if writer.handle.join().is_err() {
-        log::warn!("tile cache writer thread panicked");
+    match cache.commit_prepared_tile_cache_commits(commits) {
+        Ok(committed_snapshots) => {
+            if let Ok(mut snapshots) = authority_snapshots.lock() {
+                for (key, snapshot) in committed_snapshots {
+                    snapshots.insert(key, TileAuthoritySnapshotState::Ready(Arc::new(snapshot)));
+                }
+            }
+            log::trace!("tile cache batch commit complete (tiles={commit_count})");
+        }
+        Err(error) => {
+            log::warn!(
+                "tile cache batch commit failed (tiles={}, error={})",
+                commit_count,
+                error
+            );
+        }
+    }
+}
+
+fn encode_tile_cache_write_payload(
+    key: &TileCacheKey,
+    payload: &TileCacheWritePayload,
+) -> Result<Vec<u8>> {
+    match payload {
+        TileCacheWritePayload::FastRgbaZstd {
+            rgba,
+            width,
+            height,
+            region,
+            chunk_positions,
+            validation_seed,
+            flags,
+        } => {
+            let validation_value =
+                tile_cache_validation_value(key, region, chunk_positions, *validation_seed);
+            if *flags == FAST_RGBA_ZSTD_FLAG_EMPTY_NEGATIVE {
+                return encode_fast_rgba_zstd_empty_negative(*width, *height, validation_value);
+            }
+            encode_fast_rgba_zstd_with_validation_and_flags(
+                rgba.as_ref(),
+                *width,
+                *height,
+                validation_value,
+                *flags,
+            )
+        }
+        TileCacheWritePayload::EmptyNegative {
+            tile_size,
+            region,
+            validation_seed,
+        } => {
+            let validation_value = tile_cache_validation_value(key, region, &[], *validation_seed);
+            encode_fast_rgba_zstd_empty_negative(*tile_size, *tile_size, validation_value)
+        }
     }
 }
 
@@ -4178,8 +4425,6 @@ pub struct MapRenderSessionConfig {
     pub palette_version: u32,
     /// Query exact render chunks for each cache miss before baking.
     pub cull_missing_chunks: bool,
-    /// Maximum number of chunk bakes retained by the session sidecar memory cache.
-    pub chunk_bake_cache_memory_limit: usize,
     /// Maximum number of baked regions retained by the session memory cache.
     pub region_bake_cache_memory_limit: usize,
     /// Preferred GPU backend for the reusable session context.
@@ -4196,7 +4441,6 @@ impl Default for MapRenderSessionConfig {
             renderer_version: RENDERER_CACHE_VERSION,
             palette_version: DEFAULT_PALETTE_VERSION,
             cull_missing_chunks: true,
-            chunk_bake_cache_memory_limit: 4096,
             region_bake_cache_memory_limit: 128,
             gpu_backend: RenderGpuBackend::Auto,
         }
@@ -4219,7 +4463,6 @@ impl MapRenderSessionConfig {
             renderer_version: RENDERER_CACHE_VERSION,
             palette_version: DEFAULT_PALETTE_VERSION,
             cull_missing_chunks: true,
-            chunk_bake_cache_memory_limit: 16_384,
             region_bake_cache_memory_limit: 512,
             gpu_backend: RenderGpuBackend::Auto,
         }
@@ -4231,9 +4474,6 @@ impl MapRenderSessionConfig {
 pub enum TileReadySource {
     /// Decoded tile came from the session in-memory tile cache.
     MemoryCache,
-    /// Decoded tile came from a disk cache entry whose session signature matched, before exact
-    /// chunk validation completed.
-    DiskCacheOptimistic,
     /// Decoded tile came from a validated disk cache entry.
     DiskCacheFresh,
     /// Decoded tile came from a disk cache entry without validation.
@@ -4257,12 +4497,10 @@ pub enum TileStreamEvent {
         /// Source that produced the tile.
         source: TileReadySource,
     },
-    /// Exact cache validation finished for a previously emitted optimistic tile.
-    CacheValidation {
-        /// Planned tile that was validated.
+    /// Tile is known to contain no renderable content.
+    Empty {
+        /// Planned tile that was satisfied as empty.
         planned: PlannedTile,
-        /// Validation outcome.
-        outcome: TileCacheValidationOutcome,
     },
     /// Tile could not be rendered.
     Failed {
@@ -4282,13 +4520,40 @@ pub enum TileStreamEvent {
     },
 }
 
-/// Result of an exact tile cache validation check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TileCacheValidationOutcome {
-    /// The cached tile still matches the exact chunk validation value.
-    Valid,
-    /// The tile was displayed optimistically but must be refreshed by rendering.
-    Mismatch,
+/// Streaming events emitted by the decoded v2 tile stream.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum TileStreamEventV2 {
+    /// Tile is decoded and ready to display.
+    Ready {
+        /// Planned tile that was satisfied.
+        planned: PlannedTile,
+        /// Decoded tile image.
+        tile: DecodedTileImage,
+        /// Source that produced the tile.
+        source: TileReadySource,
+    },
+    /// Tile is known to contain no renderable content.
+    Empty {
+        /// Planned tile that was satisfied as empty.
+        planned: PlannedTile,
+    },
+    /// Tile could not be rendered.
+    Failed {
+        /// Planned tile that failed.
+        planned: PlannedTile,
+        /// Human-readable failure message.
+        error: String,
+    },
+    /// Aggregate progress update.
+    Progress(RenderProgress),
+    /// Stream finished.
+    Complete {
+        /// Aggregated diagnostics.
+        diagnostics: RenderDiagnostics,
+        /// Aggregated pipeline stats.
+        stats: RenderPipelineStats,
+    },
 }
 
 /// Reusable render session that keeps world, renderer, and tile cache alive
@@ -4300,6 +4565,9 @@ where
 {
     renderer: MapRenderer<S>,
     cache: Arc<Mutex<TileCache>>,
+    cache_writer: Arc<Mutex<Option<TileCacheWriterPool>>>,
+    authority_snapshots: TileAuthoritySnapshotCache,
+    session_tile_memory: Arc<Mutex<SessionTileMemoryIndex>>,
     gpu: Option<GpuRenderContext>,
     config: MapRenderSessionConfig,
 }
@@ -4340,14 +4608,6 @@ where
             config.cache_root.clone(),
             config.tile_cache_memory_limit.max(1),
         );
-        let bake_cache = Arc::new(Mutex::new(ChunkBakeCache::new(
-            config.cache_root.clone(),
-            config.chunk_bake_cache_memory_limit.max(1),
-            config.world_id.clone(),
-            config.world_signature.clone(),
-            config.renderer_version,
-            config.palette_version,
-        )));
         let region_cache = Arc::new(Mutex::new(RegionBakeMemoryCache::new(
             config.region_bake_cache_memory_limit.max(1),
             config.renderer_version,
@@ -4356,13 +4616,40 @@ where
         let gpu = GpuRenderContext::new(config.gpu_backend).ok();
         Self {
             renderer: renderer
-                .with_chunk_bake_cache(bake_cache)
                 .with_region_bake_cache(region_cache)
                 .with_gpu_context(gpu.clone()),
             cache: Arc::new(Mutex::new(cache)),
+            cache_writer: Arc::new(Mutex::new(None)),
+            authority_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
+            session_tile_memory: Arc::new(Mutex::new(SessionTileMemoryIndex::new(
+                config.tile_cache_memory_limit.max(1),
+            ))),
             gpu,
             config,
         }
+    }
+
+    fn tile_cache_writer(
+        &self,
+        options: &RenderOptions,
+        work_items: usize,
+    ) -> Option<TileCacheWriterPool> {
+        let mut writer = match self.cache_writer.lock() {
+            Ok(writer) => writer,
+            Err(_) => {
+                log::warn!("tile cache writer pool lock was poisoned");
+                return None;
+            }
+        };
+        if writer.is_none() {
+            *writer = spawn_tile_cache_writer(
+                Arc::clone(&self.cache),
+                Arc::clone(&self.authority_snapshots),
+                options,
+                work_items,
+            );
+        }
+        writer.clone()
     }
 
     /// Returns the underlying renderer.
@@ -4430,6 +4717,7 @@ where
         let mut render_tiles;
         let stream_started = Instant::now();
         let rendered_stream_count = Arc::new(AtomicUsize::new(0));
+        let tile_cache_writer_dropped_count = Arc::new(AtomicUsize::new(0));
         let mut failed_stream_count = 0usize;
 
         log::debug!(
@@ -4442,10 +4730,19 @@ where
         );
 
         let ordered_tiles = prioritized_planned_tiles(planned_tiles, options.priority);
-        if options.cache_policy == RenderCachePolicy::Use {
+        let cache_read_format = matches!(options.cache_policy, RenderCachePolicy::Use)
+            .then_some(ImageFormat::FastRgbaZstd);
+        let cache_write_format = matches!(
+            options.cache_policy,
+            RenderCachePolicy::Use | RenderCachePolicy::Refresh
+        )
+        .then_some(ImageFormat::FastRgbaZstd);
+        if let Some(cache_format) = cache_read_format {
             let probe_workers = resolve_cpu_worker_count(&options, ordered_tiles.len())?.max(1);
             let cache = Arc::clone(&self.cache);
-            let output_format = options.format;
+            let session_tile_memory = Arc::clone(&self.session_tile_memory);
+            let authority_snapshots = Arc::clone(&self.authority_snapshots);
+            let render_format = options.format;
             let validation_seed = options.tile_cache_validation_seed;
             cached_stats.peak_worker_threads = cached_stats.peak_worker_threads.max(probe_workers);
 
@@ -4460,11 +4757,17 @@ where
                     cached_stats.cache_read_ms.saturating_add(probe.read_ms);
                 cached_stats.cache_decode_ms =
                     cached_stats.cache_decode_ms.saturating_add(probe.decode_ms);
+                cached_stats.tile_blob_decode_ms = cached_stats
+                    .tile_blob_decode_ms
+                    .saturating_add(probe.decode_ms);
                 if probe.validation_mismatch {
                     cached_stats.cache_validation_mismatches =
                         cached_stats.cache_validation_mismatches.saturating_add(1);
                 }
-                let exact_validation = probe.exact_validation;
+                if probe.corrupt_miss {
+                    cached_stats.index_corrupt_misses =
+                        cached_stats.index_corrupt_misses.saturating_add(1);
+                }
                 match probe.decision {
                     TileCacheProbeDecision::Ready { tile, source } => {
                         cached_diagnostics.cache_hits =
@@ -4474,10 +4777,6 @@ where
                             TileReadySource::MemoryCache => {
                                 cached_stats.cache_memory_hits =
                                     cached_stats.cache_memory_hits.saturating_add(1);
-                            }
-                            TileReadySource::DiskCacheOptimistic => {
-                                cached_stats.cache_disk_stale_hits =
-                                    cached_stats.cache_disk_stale_hits.saturating_add(1);
                             }
                             TileReadySource::DiskCacheFresh => {
                                 cached_stats.cache_disk_fresh_hits =
@@ -4508,26 +4807,15 @@ where
                             tile,
                             source,
                         })?;
-                        if let Some(outcome) = exact_validation {
-                            sink.as_ref()(TileStreamEvent::CacheValidation {
-                                planned: planned.clone(),
-                                outcome,
-                            })?;
-                            if outcome == TileCacheValidationOutcome::Mismatch {
-                                cache_misses.push((ordinal, planned));
-                            }
-                        }
                     }
                     TileCacheProbeDecision::EmptyNegative => {
-                        failed_stream_count = failed_stream_count.saturating_add(1);
                         cached_diagnostics.cache_hits =
                             cached_diagnostics.cache_hits.saturating_add(1);
                         cached_stats.cache_hits = cached_stats.cache_hits.saturating_add(1);
                         cached_stats.cache_empty_negative_hits =
                             cached_stats.cache_empty_negative_hits.saturating_add(1);
-                        sink.as_ref()(TileStreamEvent::Failed {
+                        sink.as_ref()(TileStreamEvent::Empty {
                             planned: probe.planned,
-                            error: "tile has no renderable chunks".to_string(),
                         })?;
                     }
                     TileCacheProbeDecision::Miss => {
@@ -4540,15 +4828,32 @@ where
                 Ok(())
             };
 
+            let authority_snapshots_for_batch = load_tile_authority_snapshots_for_batch(
+                &cache,
+                &authority_snapshots,
+                ordered_tiles
+                    .iter()
+                    .map(|planned| self.cache_key_for_planned(planned, cache_format)),
+            )?;
+            let blob_readers_for_batch =
+                open_tile_authority_blob_readers_for_batch(&cache, &authority_snapshots_for_batch)?;
+
             if probe_workers <= 1 || ordered_tiles.len() <= 1 {
+                let mut decode_scratch = TileCacheDecodeScratch::new();
                 for (ordinal, planned) in ordered_tiles.iter().enumerate() {
-                    let cache_key = self.cache_key_for_planned(planned, output_format);
+                    let render_key = self.cache_key_for_planned(planned, render_format);
+                    let cache_key = self.cache_key_for_planned(planned, cache_format);
                     let probe = resolve_tile_cache_entry(
                         &cache,
+                        &session_tile_memory,
+                        &authority_snapshots_for_batch,
+                        &blob_readers_for_batch,
+                        &render_key,
                         &cache_key,
                         planned,
-                        output_format,
+                        cache_format,
                         validation_seed,
+                        &mut decode_scratch,
                     )?;
                     handle_probe(ordinal, probe)?;
                 }
@@ -4556,7 +4861,8 @@ where
                 struct TileCacheProbeWork {
                     ordinal: usize,
                     planned: PlannedTile,
-                    key: TileCacheKey,
+                    render_key: TileCacheKey,
+                    cache_key: TileCacheKey,
                 }
 
                 let ordered_tiles_len = ordered_tiles.len();
@@ -4564,11 +4870,13 @@ where
                     .into_iter()
                     .enumerate()
                     .map(|(ordinal, planned)| {
-                        let key = self.cache_key_for_planned(&planned, output_format);
+                        let render_key = self.cache_key_for_planned(&planned, render_format);
+                        let cache_key = self.cache_key_for_planned(&planned, cache_format);
                         TileCacheProbeWork {
                             ordinal,
                             planned,
-                            key,
+                            render_key,
+                            cache_key,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -4599,14 +4907,23 @@ where
                         let work_receiver = work_receiver.clone();
                         let result_sender = result_sender.clone();
                         let cache = Arc::clone(&cache);
+                        let session_tile_memory = Arc::clone(&session_tile_memory);
+                        let authority_snapshots_for_batch = &authority_snapshots_for_batch;
+                        let blob_readers_for_batch = &blob_readers_for_batch;
                         scope.spawn(move || {
+                            let mut decode_scratch = TileCacheDecodeScratch::new();
                             for work in &work_receiver {
                                 let result = resolve_tile_cache_entry(
                                     &cache,
-                                    &work.key,
+                                    &session_tile_memory,
+                                    authority_snapshots_for_batch,
+                                    blob_readers_for_batch,
+                                    &work.render_key,
+                                    &work.cache_key,
                                     &work.planned,
-                                    output_format,
+                                    cache_format,
                                     validation_seed,
+                                    &mut decode_scratch,
                                 )
                                 .map(|probe| (work.ordinal, probe));
                                 if result_sender.send(result).is_err() {
@@ -4668,29 +4985,28 @@ where
             }
         }
 
+        let cache_writer =
+            cache_write_format.and_then(|_| self.tile_cache_writer(&options, render_tiles.len()));
+
         let mut culled_render_tiles = Vec::new();
         for planned in self.prepare_planned_tiles_for_render(&render_tiles, &options)? {
-            if planned.chunk_positions.as_ref().is_some_and(Vec::is_empty) {
-                failed_stream_count = failed_stream_count.saturating_add(1);
-                if matches!(
-                    options.cache_policy,
-                    RenderCachePolicy::Use | RenderCachePolicy::Refresh
-                ) {
-                    let cache_key = self.cache_key_for_planned(&planned, options.format);
-                    if let Err(error) = write_empty_negative_tile_cache(
-                        &self.cache,
+            if planned
+                .chunk_positions
+                .as_ref()
+                .is_some_and(|positions| positions.is_empty())
+            {
+                if let Some(cache_format) = cache_write_format {
+                    let cache_key = self.cache_key_for_planned(&planned, cache_format);
+                    if let Some(write) = empty_negative_tile_cache_write(
                         &cache_key,
                         &planned,
-                        options.format,
+                        cache_format,
                         options.tile_cache_validation_seed,
-                    ) {
-                        log::warn!(
-                            "negative tile cache write failed (dimension={:?}, tile=({}, {}), error={})",
-                            planned.job.coord.dimension,
-                            planned.job.coord.x,
-                            planned.job.coord.z,
-                            error
-                        );
+                    ) && queue_tile_cache_write(&cache_writer, write)
+                        == TileCacheWriteQueueResult::Dropped
+                    {
+                        cached_stats.tile_cache_writer_dropped =
+                            cached_stats.tile_cache_writer_dropped.saturating_add(1);
                     }
                 }
                 log::debug!(
@@ -4699,10 +5015,7 @@ where
                     planned.job.coord.x,
                     planned.job.coord.z
                 );
-                sink.as_ref()(TileStreamEvent::Failed {
-                    planned,
-                    error: "tile has no renderable chunks".to_string(),
-                })?;
+                sink.as_ref()(TileStreamEvent::Empty { planned })?;
             } else {
                 culled_render_tiles.push(planned);
             }
@@ -4728,67 +5041,47 @@ where
         let mut final_diagnostics = cached_diagnostics.clone();
         let mut final_stats = cached_stats.clone();
         if !render_tiles.is_empty() {
-            let cache_policy = options.cache_policy;
-            let output_format = options.format;
+            let render_format = options.format;
             let tile_cache_validation_seed = options.tile_cache_validation_seed;
             let render_group_size = render_tile_stream_group_size(&options, render_tiles.len())?;
-            let cache_writer = matches!(
-                cache_policy,
-                RenderCachePolicy::Use | RenderCachePolicy::Refresh
-            )
-            .then(|| spawn_tile_cache_writer(Arc::clone(&self.cache)))
-            .flatten();
             let sink = Arc::clone(&sink);
             let rendered_stream_count_for_sink = Arc::clone(&rendered_stream_count);
+            let writer_dropped_for_sink = Arc::clone(&tile_cache_writer_dropped_count);
             for render_group in render_tiles.chunks(render_group_size) {
                 let rendered = self.renderer.render_web_tiles_blocking(
                     render_group,
                     options.clone(),
-                    |planned, mut tile| {
-                        let cache_key = self.cache_key_for_planned(&planned, output_format);
-                        if output_format == ImageFormat::FastRgbaZstd
-                            && tile_cache_validation_seed != 0
-                        {
-                            if let Some(chunk_positions) = planned.chunk_positions.as_deref() {
-                                let validation_value = tile_cache_validation_value(
-                                    &cache_key,
-                                    &planned.region,
-                                    chunk_positions,
-                                    tile_cache_validation_seed,
-                                );
-                                let flags = if chunk_positions.is_empty() {
-                                    FAST_RGBA_ZSTD_FLAG_EMPTY_NEGATIVE
-                                } else {
-                                    FAST_RGBA_ZSTD_FLAG_NON_EMPTY
-                                };
-                                tile.encoded = Some(encode_fast_rgba_zstd_with_validation_and_flags(
-                                    &tile.rgba,
-                                    tile.width,
-                                    tile.height,
-                                    validation_value,
-                                    flags,
-                                )?);
-                            } else {
-                                tile.encoded = None;
+                    |planned, tile| {
+                        let render_key = self.cache_key_for_planned(&planned, render_format);
+                        let session_memory_key =
+                            session_tile_memory_key(&render_key, &planned, tile_cache_validation_seed);
+                        let cache_write = cache_write_format.and_then(|cache_format| {
+                            let Some(chunk_positions) = planned.chunk_positions.as_ref() else {
                                 log::trace!(
-                                    "skipping validated tile cache write without exact chunk positions (dimension={:?}, tile=({}, {}))",
+                                    "skipping cache write without exact chunk positions (dimension={:?}, tile=({}, {}))",
                                     planned.job.coord.dimension,
                                     planned.job.coord.x,
                                     planned.job.coord.z
                                 );
-                            }
-                        }
-                        let cache_write = if matches!(
-                            cache_policy,
-                            RenderCachePolicy::Use | RenderCachePolicy::Refresh
-                        ) {
-                            tile.encoded.as_ref().map(|encoded| TileCacheWrite {
-                                key: cache_key.clone(),
-                                encoded: encoded.clone(),
+                                return None;
+                            };
+                            Some(TileCacheWrite {
+                                key: self.cache_key_for_planned(&planned, cache_format),
+                                payload: TileCacheWritePayload::FastRgbaZstd {
+                                    rgba: Arc::clone(&tile.rgba),
+                                    width: tile.width,
+                                    height: tile.height,
+                                    region: planned.region,
+                                    chunk_positions: Arc::clone(chunk_positions),
+                                    validation_seed: tile_cache_validation_seed,
+                                    flags: if chunk_positions.is_empty() {
+                                        FAST_RGBA_ZSTD_FLAG_EMPTY_NEGATIVE
+                                    } else {
+                                        FAST_RGBA_ZSTD_FLAG_NON_EMPTY
+                                    },
+                                },
                             })
-                        } else {
-                            None
-                        };
+                        });
                         rendered_stream_count_for_sink.fetch_add(1, Ordering::Relaxed);
                         log::trace!(
                             "tile rendered (dimension={:?}, tile=({}, {}), width={}, height={}, encoded_bytes={})",
@@ -4797,12 +5090,39 @@ where
                             planned.job.coord.z,
                             tile.width,
                             tile.height,
-                            tile.encoded.as_ref().map_or(0, Vec::len)
+                            tile.rgba.len()
                         );
                         if let Ok(mut cache) = self.cache.lock() {
-                            cache.insert_memory(cache_key.clone(), tile.clone());
+                            cache.insert_memory(
+                                render_key,
+                                TileImage {
+                                    coord: tile.coord,
+                                    width: tile.width,
+                                    height: tile.height,
+                                    rgba: Arc::clone(&tile.rgba),
+                                    encoded: None,
+                                },
+                            );
                         } else {
                             log::warn!("tile cache lock was poisoned while storing rendered tile");
+                        }
+                        if let Some(session_memory_key) = session_memory_key {
+                            if let Ok(mut session_memory) = self.session_tile_memory.lock() {
+                                session_memory.insert(
+                                    session_memory_key,
+                                    TileImage {
+                                        coord: tile.coord,
+                                        width: tile.width,
+                                        height: tile.height,
+                                        rgba: Arc::clone(&tile.rgba),
+                                        encoded: None,
+                                    },
+                                );
+                            } else {
+                                log::warn!(
+                                    "session tile memory lock was poisoned while storing render hit"
+                                );
+                            }
                         }
                         sink.as_ref()(TileStreamEvent::Ready {
                             planned,
@@ -4810,7 +5130,11 @@ where
                             source: TileReadySource::Render,
                         })?;
                         if let Some(cache_write) = cache_write {
-                            queue_tile_cache_write(&cache_writer, cache_write);
+                            if queue_tile_cache_write(&cache_writer, cache_write)
+                                == TileCacheWriteQueueResult::Dropped
+                            {
+                                writer_dropped_for_sink.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Ok(())
                     },
@@ -4836,12 +5160,13 @@ where
                                 error: message.clone(),
                             })?;
                         }
-                        flush_tile_cache_writer(cache_writer);
                         return Err(error);
                     }
                 }
             }
-            flush_tile_cache_writer(cache_writer);
+            final_stats.tile_cache_writer_dropped = final_stats
+                .tile_cache_writer_dropped
+                .saturating_add(tile_cache_writer_dropped_count.load(Ordering::Relaxed));
             final_stats.planned_tiles = planned_tiles.len();
         }
 
@@ -4850,7 +5175,7 @@ where
             stats: final_stats,
         };
         log::debug!(
-            "streaming web tiles complete (tiles={}, cached={}, cache_misses={}, cache_probes={}, cache_validation_mismatches={}, cache_read_ms={}, cache_decode_ms={}, rendered={}, failed={}, worker_threads={}, world_worker_threads={}, chunk_bake_cache_hits={}, chunk_bake_cache_misses={}, chunk_bake_memory_hits={}, chunk_bake_disk_hits={}, chunk_bake_writes={}, cpu_tiles={}, exact_get_batches={}, exact_keys_requested={}, exact_keys_found={}, render_prefix_scans={}, world_load_ms={}, db_read_ms={}, decode_ms={}, cpu_decode_ms={}, cpu_frame_pack_ms={}, biome_parse_ms={}, subchunk_parse_ms={}, surface_scan_ms={}, block_entity_parse_ms={}, full_reload_ms={}, region_copy_ms={}, elapsed_ms={})",
+            "streaming web tiles complete (tiles={}, cached={}, cache_misses={}, cache_probes={}, cache_validation_mismatches={}, cache_read_ms={}, cache_decode_ms={}, tile_blob_decode_ms={}, tile_index_trusted_hits={}, tile_index_validated_hits={}, tile_index_misses={}, tile_index_empty_hits={}, tile_index_read_ms={}, tile_dep_validation_ms={}, writer_dropped={}, index_corrupt_misses={}, rendered={}, failed={}, worker_threads={}, world_worker_threads={}, cpu_tiles={}, exact_get_batches={}, exact_keys_requested={}, exact_keys_found={}, render_prefix_scans={}, world_load_ms={}, db_read_ms={}, decode_ms={}, cpu_decode_ms={}, cpu_frame_pack_ms={}, biome_parse_ms={}, subchunk_parse_ms={}, surface_scan_ms={}, block_entity_parse_ms={}, full_reload_ms={}, region_copy_ms={}, elapsed_ms={})",
             planned_tiles.len(),
             cached_stats.cache_hits,
             cached_stats.cache_misses,
@@ -4858,15 +5183,19 @@ where
             cached_stats.cache_validation_mismatches,
             cached_stats.cache_read_ms,
             cached_stats.cache_decode_ms,
+            result.stats.tile_blob_decode_ms,
+            result.stats.tile_index_trusted_hits,
+            result.stats.tile_index_validated_hits,
+            result.stats.tile_index_misses,
+            result.stats.tile_index_empty_hits,
+            result.stats.tile_index_read_ms,
+            result.stats.tile_dep_validation_ms,
+            result.stats.tile_cache_writer_dropped,
+            result.stats.index_corrupt_misses,
             rendered_stream_count.load(Ordering::Relaxed),
             failed_stream_count,
             result.stats.peak_worker_threads,
             result.stats.world_worker_threads,
-            result.stats.chunk_bake_cache_hits,
-            result.stats.chunk_bake_cache_misses,
-            result.stats.chunk_bake_cache_memory_hits,
-            result.stats.chunk_bake_cache_disk_hits,
-            result.stats.chunk_bake_cache_writes,
             result.stats.cpu_tiles,
             result.stats.exact_get_batches,
             result.stats.exact_keys_requested,
@@ -4892,6 +5221,53 @@ where
         Ok(result)
     }
 
+    /// Renders planned web tiles and streams decoded pixel buffers suitable for interactive UI
+    /// display.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if rendering, cancellation, cache decoding, or the sink fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn render_web_tiles_streaming_blocking_v2<F>(
+        &self,
+        planned_tiles: &[PlannedTile],
+        mut options: RenderOptions,
+        output: RenderTileOutputOptions,
+        sink: F,
+    ) -> Result<RenderWebTilesResult>
+    where
+        F: Fn(TileStreamEventV2) -> Result<()> + Send + Sync + 'static,
+    {
+        options.format = ImageFormat::Rgba;
+        let sink = Arc::new(sink);
+        self.render_web_tiles_streaming_blocking(planned_tiles, options, {
+            let sink = Arc::clone(&sink);
+            move |event| match event {
+                TileStreamEvent::Ready {
+                    planned,
+                    tile,
+                    source,
+                } => sink.as_ref()(TileStreamEventV2::Ready {
+                    planned,
+                    tile: decoded_tile_from_tile_image(tile, output),
+                    source,
+                }),
+                TileStreamEvent::Empty { planned } => {
+                    sink.as_ref()(TileStreamEventV2::Empty { planned })
+                }
+                TileStreamEvent::Failed { planned, error } => {
+                    sink.as_ref()(TileStreamEventV2::Failed { planned, error })
+                }
+                TileStreamEvent::Progress(progress) => {
+                    sink.as_ref()(TileStreamEventV2::Progress(progress))
+                }
+                TileStreamEvent::Complete { diagnostics, stats } => {
+                    sink.as_ref()(TileStreamEventV2::Complete { diagnostics, stats })
+                }
+            }
+        })
+    }
+
     #[cfg(feature = "async")]
     /// Runs [`MapRenderSession::render_web_tiles_streaming_blocking`] on a Tokio
     /// blocking task.
@@ -4910,6 +5286,30 @@ where
     {
         tokio::task::spawn_blocking(move || {
             self.render_web_tiles_streaming_blocking(&planned_tiles, options, sink)
+        })
+        .await
+        .map_err(|error| BedrockRenderError::Join(error.to_string()))?
+    }
+
+    #[cfg(feature = "async")]
+    /// Runs [`MapRenderSession::render_web_tiles_streaming_blocking_v2`] on a Tokio
+    /// blocking task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task fails or rendering fails.
+    pub async fn render_web_tiles_streaming_v2<F>(
+        self: Arc<Self>,
+        planned_tiles: Vec<PlannedTile>,
+        options: RenderOptions,
+        output: RenderTileOutputOptions,
+        sink: F,
+    ) -> Result<RenderWebTilesResult>
+    where
+        F: Fn(TileStreamEventV2) -> Result<()> + Send + Sync + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            self.render_web_tiles_streaming_blocking_v2(&planned_tiles, options, output, sink)
         })
         .await
         .map_err(|error| BedrockRenderError::Join(error.to_string()))?
@@ -4962,6 +5362,56 @@ where
         Ok(receiver)
     }
 
+    #[cfg(feature = "async")]
+    /// Starts streaming decoded web-map tiles on a Tokio blocking task and returns an
+    /// async receiver for tile events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the channel capacity is invalid.
+    pub async fn render_web_tiles_streaming_channel_v2(
+        self: Arc<Self>,
+        planned_tiles: Vec<PlannedTile>,
+        options: RenderOptions,
+        output: RenderTileOutputOptions,
+        capacity: usize,
+    ) -> Result<tokio::sync::mpsc::Receiver<TileStreamEventV2>> {
+        let capacity = capacity.max(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+        let error_sender = sender.clone();
+        let planned_tiles_for_error = planned_tiles.clone();
+        tokio::task::spawn_blocking(move || {
+            let send_event = move |event| {
+                sender.blocking_send(event).map_err(|_| {
+                    BedrockRenderError::Validation(
+                        "decoded tile stream receiver was dropped".to_string(),
+                    )
+                })
+            };
+            if let Err(error) = self.render_web_tiles_streaming_blocking_v2(
+                &planned_tiles,
+                options,
+                output,
+                send_event,
+            ) {
+                log::warn!("decoded tile stream task failed: {error}");
+                let message = error.to_string();
+                for planned in planned_tiles_for_error {
+                    if error_sender
+                        .blocking_send(TileStreamEventV2::Failed {
+                            planned,
+                            error: message.clone(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
     fn prepare_planned_tiles_for_render(
         &self,
         planned_tiles: &[PlannedTile],
@@ -5000,7 +5450,7 @@ where
                 positions.len()
             );
             let mut planned = planned.clone();
-            planned.chunk_positions = Some(positions);
+            planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(positions));
             prepared.push(planned);
             check_cancelled(options)?;
         }
@@ -5127,7 +5577,59 @@ struct TileCacheProbe {
     read_ms: u128,
     decode_ms: u128,
     validation_mismatch: bool,
-    exact_validation: Option<TileCacheValidationOutcome>,
+    corrupt_miss: bool,
+}
+
+struct TileCacheDecodeScratch {
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
+    rgba: Vec<u8>,
+}
+
+impl TileCacheDecodeScratch {
+    const fn new() -> Self {
+        Self {
+            decompressor: None,
+            rgba: Vec::new(),
+        }
+    }
+
+    fn decompress_into_scratch(&mut self, payload: &[u8], expected_len: usize) -> Result<()> {
+        if self.decompressor.is_none() {
+            self.decompressor =
+                Some(zstd::bulk::Decompressor::new().map_err(|error| {
+                    BedrockRenderError::io("failed to create zstd decoder", error)
+                })?);
+        }
+        let Some(decompressor) = self.decompressor.as_mut() else {
+            return Err(BedrockRenderError::Validation(
+                "zstd decoder was not initialized".to_string(),
+            ));
+        };
+        self.rgba.clear();
+        if self.rgba.capacity() < expected_len {
+            self.rgba.reserve_exact(expected_len - self.rgba.capacity());
+        }
+        let written = decompressor
+            .decompress_to_buffer(payload, &mut self.rgba)
+            .map_err(|error| BedrockRenderError::io("failed to decode zstd tile", error))?;
+        if written != expected_len || self.rgba.len() != expected_len {
+            return Err(BedrockRenderError::Validation(format!(
+                "fast tile decoded length mismatch: expected {expected_len}, got {}",
+                self.rgba.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn decompress_to_vec(&mut self, payload: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+        self.decompress_into_scratch(payload, expected_len)?;
+        Ok(self.rgba.clone())
+    }
+
+    fn decompress_to_arc(&mut self, payload: &[u8], expected_len: usize) -> Result<Arc<[u8]>> {
+        self.decompress_into_scratch(payload, expected_len)?;
+        Ok(Arc::<[u8]>::from(&self.rgba[..]))
+    }
 }
 
 enum TileCacheProbeDecision {
@@ -5139,19 +5641,45 @@ enum TileCacheProbeDecision {
     Miss,
 }
 
+fn tile_cache_probe_miss(
+    planned: &PlannedTile,
+    read_ms: u128,
+    decode_ms: u128,
+    validation_mismatch: bool,
+    corrupt_miss: bool,
+) -> TileCacheProbe {
+    TileCacheProbe {
+        planned: planned.clone(),
+        decision: TileCacheProbeDecision::Miss,
+        read_ms,
+        decode_ms,
+        validation_mismatch,
+        corrupt_miss,
+    }
+}
+
 fn resolve_tile_cache_entry(
     cache: &Arc<Mutex<TileCache>>,
-    key: &TileCacheKey,
+    session_tile_memory: &Arc<Mutex<SessionTileMemoryIndex>>,
+    authority_snapshots: &BTreeMap<TileAuthorityCacheKey, TileAuthoritySnapshotState>,
+    blob_readers: &BTreeMap<TileAuthorityCacheKey, TileAuthorityBlobReaderState>,
+    render_key: &TileCacheKey,
+    cache_key: &TileCacheKey,
     planned: &PlannedTile,
     format: ImageFormat,
     validation_seed: u64,
+    scratch: &mut TileCacheDecodeScratch,
 ) -> Result<TileCacheProbe> {
     let mut read_ms = 0;
     let mut decode_ms = 0;
-    if let Some(tile) = cache
-        .lock()
-        .map_err(|_| BedrockRenderError::Validation("tile cache lock was poisoned".to_string()))?
-        .get_memory(key)
+    let session_memory_key = session_tile_memory_key(render_key, planned, validation_seed);
+    if let Some(memory_key) = session_memory_key.as_ref()
+        && let Some(tile) = session_tile_memory
+            .lock()
+            .map_err(|_| {
+                BedrockRenderError::Validation("session tile memory lock was poisoned".to_string())
+            })?
+            .get(memory_key)
     {
         return Ok(TileCacheProbe {
             planned: planned.clone(),
@@ -5162,38 +5690,81 @@ fn resolve_tile_cache_entry(
             read_ms,
             decode_ms,
             validation_mismatch: false,
-            exact_validation: None,
+            corrupt_miss: false,
+        });
+    }
+
+    if let Some(tile) = cache
+        .lock()
+        .map_err(|_| BedrockRenderError::Validation("tile cache lock was poisoned".to_string()))?
+        .get_memory(render_key)
+    {
+        if let Some(memory_key) = session_memory_key {
+            if let Ok(mut session_memory) = session_tile_memory.lock() {
+                session_memory.insert(memory_key, tile.clone());
+            } else {
+                log::warn!("session tile memory lock was poisoned while storing cache hit");
+            }
+        }
+        return Ok(TileCacheProbe {
+            planned: planned.clone(),
+            decision: TileCacheProbeDecision::Ready {
+                tile,
+                source: TileReadySource::MemoryCache,
+            },
+            read_ms,
+            decode_ms,
+            validation_mismatch: false,
+            corrupt_miss: false,
         });
     }
 
     if format != ImageFormat::FastRgbaZstd {
-        return Ok(TileCacheProbe {
-            planned: planned.clone(),
-            decision: TileCacheProbeDecision::Miss,
-            read_ms,
-            decode_ms,
-            validation_mismatch: false,
-            exact_validation: None,
-        });
+        return Ok(tile_cache_probe_miss(
+            planned, read_ms, decode_ms, false, false,
+        ));
     }
 
-    let path = cache
-        .lock()
-        .map_err(|_| BedrockRenderError::Validation("tile cache lock was poisoned".to_string()))?
-        .path_for_key(key);
     let read_started = Instant::now();
-    let encoded = match fs::read(path) {
-        Ok(encoded) => encoded,
-        Err(_) => {
+    let authority_key = tile_authority_cache_key_from_tile_key(cache_key);
+    let disk_read = match authority_snapshots.get(&authority_key) {
+        Some(TileAuthoritySnapshotState::Ready(authority_snapshot)) => {
+            let blob_reader = match blob_readers.get(&authority_key) {
+                Some(TileAuthorityBlobReaderState::Ready(reader)) => Some(Arc::as_ref(reader)),
+                Some(TileAuthorityBlobReaderState::Missing) => None,
+                None => None,
+            };
+            let blob_reader_known_missing = matches!(
+                blob_readers.get(&authority_key),
+                Some(TileAuthorityBlobReaderState::Missing)
+            );
+            let cache = cache.lock().map_err(|_| {
+                BedrockRenderError::Validation("tile cache lock was poisoned".to_string())
+            })?;
+            cache.get_disk_with_snapshot(
+                cache_key,
+                &authority_key,
+                Some(authority_snapshot),
+                blob_reader,
+                blob_reader_known_missing,
+            )
+        }
+        Some(TileAuthoritySnapshotState::Corrupt) => TileCacheDiskRead::Corrupt,
+        Some(TileAuthoritySnapshotState::Missing) | None => TileCacheDiskRead::Miss,
+    };
+    let encoded = match disk_read {
+        TileCacheDiskRead::Hit(encoded) => encoded,
+        TileCacheDiskRead::Miss => {
             read_ms = read_started.elapsed().as_millis();
-            return Ok(TileCacheProbe {
-                planned: planned.clone(),
-                decision: TileCacheProbeDecision::Miss,
-                read_ms,
-                decode_ms,
-                validation_mismatch: false,
-                exact_validation: None,
-            });
+            return Ok(tile_cache_probe_miss(
+                planned, read_ms, decode_ms, false, false,
+            ));
+        }
+        TileCacheDiskRead::Corrupt => {
+            read_ms = read_started.elapsed().as_millis();
+            return Ok(tile_cache_probe_miss(
+                planned, read_ms, decode_ms, false, true,
+            ));
         }
     };
     read_ms = read_started.elapsed().as_millis();
@@ -5208,55 +5779,34 @@ fn resolve_tile_cache_entry(
                 planned.job.coord.z,
                 error
             );
-            return Ok(TileCacheProbe {
-                planned: planned.clone(),
-                decision: TileCacheProbeDecision::Miss,
-                read_ms,
-                decode_ms,
-                validation_mismatch: false,
-                exact_validation: None,
-            });
+            return Ok(tile_cache_probe_miss(
+                planned, read_ms, decode_ms, false, true,
+            ));
         }
     };
     if header.width != planned.job.tile_size || header.height != planned.job.tile_size {
-        return Ok(TileCacheProbe {
-            planned: planned.clone(),
-            decision: TileCacheProbeDecision::Miss,
-            read_ms,
-            decode_ms,
-            validation_mismatch: false,
-            exact_validation: None,
-        });
+        return Ok(tile_cache_probe_miss(
+            planned, read_ms, decode_ms, false, true,
+        ));
     }
 
     let chunk_positions = planned.chunk_positions.as_deref();
-    let mut exact_validation = None;
     if validation_seed != 0 {
         let Some(chunk_positions) = chunk_positions else {
-            return Ok(TileCacheProbe {
-                planned: planned.clone(),
-                decision: TileCacheProbeDecision::Miss,
-                read_ms,
-                decode_ms,
-                validation_mismatch: false,
-                exact_validation: None,
-            });
+            return Ok(tile_cache_probe_miss(
+                planned, read_ms, decode_ms, false, false,
+            ));
         };
-        let expected =
-            tile_cache_validation_value(key, &planned.region, chunk_positions, validation_seed);
-        if header.validation_value == Some(expected) {
-            exact_validation = Some(TileCacheValidationOutcome::Valid);
-        } else if header.validation_value.is_some() {
-            exact_validation = Some(TileCacheValidationOutcome::Mismatch);
-        } else {
-            return Ok(TileCacheProbe {
-                planned: planned.clone(),
-                decision: TileCacheProbeDecision::Miss,
-                read_ms,
-                decode_ms,
-                validation_mismatch: true,
-                exact_validation: None,
-            });
+        let expected = tile_cache_validation_value(
+            cache_key,
+            &planned.region,
+            chunk_positions,
+            validation_seed,
+        );
+        if header.validation_value != Some(expected) {
+            return Ok(tile_cache_probe_miss(
+                planned, read_ms, decode_ms, true, false,
+            ));
         }
     }
 
@@ -5271,12 +5821,12 @@ fn resolve_tile_cache_entry(
             read_ms,
             decode_ms,
             validation_mismatch: false,
-            exact_validation: None,
+            corrupt_miss: !chunk_positions.is_some_and(<[ChunkPos]>::is_empty),
         });
     }
 
     let decode_started = Instant::now();
-    let decoded = match decode_fast_rgba_zstd(&encoded) {
+    let decoded = match decode_fast_rgba_zstd_shared_with_header(&encoded, header, scratch) {
         Ok(decoded) => decoded,
         Err(error) => {
             decode_ms = decode_started.elapsed().as_millis();
@@ -5287,14 +5837,9 @@ fn resolve_tile_cache_entry(
                 planned.job.coord.z,
                 error
             );
-            return Ok(TileCacheProbe {
-                planned: planned.clone(),
-                decision: TileCacheProbeDecision::Miss,
-                read_ms,
-                decode_ms,
-                validation_mismatch: false,
-                exact_validation: None,
-            });
+            return Ok(tile_cache_probe_miss(
+                planned, read_ms, decode_ms, false, true,
+            ));
         }
     };
     decode_ms = decode_started.elapsed().as_millis();
@@ -5310,7 +5855,7 @@ fn resolve_tile_cache_entry(
             read_ms,
             decode_ms,
             validation_mismatch: false,
-            exact_validation: None,
+            corrupt_miss: !chunk_positions.is_some_and(<[ChunkPos]>::is_empty),
         });
     }
 
@@ -5321,9 +5866,7 @@ fn resolve_tile_cache_entry(
         rgba: decoded.rgba,
         encoded: Some(encoded),
     };
-    let source = if exact_validation.is_some() {
-        TileReadySource::DiskCacheOptimistic
-    } else if header.validation_value.is_some() {
+    let source = if header.validation_value.is_some() {
         TileReadySource::DiskCacheFresh
     } else {
         TileReadySource::DiskCacheStale
@@ -5331,47 +5874,63 @@ fn resolve_tile_cache_entry(
     cache
         .lock()
         .map_err(|_| BedrockRenderError::Validation("tile cache lock was poisoned".to_string()))?
-        .insert_memory(key.clone(), tile.clone());
+        .insert_memory(
+            render_key.clone(),
+            TileImage {
+                coord: tile.coord,
+                width: tile.width,
+                height: tile.height,
+                rgba: Arc::clone(&tile.rgba),
+                encoded: None,
+            },
+        );
+    if let Some(memory_key) = session_memory_key {
+        if let Ok(mut session_memory) = session_tile_memory.lock() {
+            session_memory.insert(
+                memory_key,
+                TileImage {
+                    coord: tile.coord,
+                    width: tile.width,
+                    height: tile.height,
+                    rgba: Arc::clone(&tile.rgba),
+                    encoded: None,
+                },
+            );
+        } else {
+            log::warn!("session tile memory lock was poisoned while storing disk hit");
+        }
+    }
     Ok(TileCacheProbe {
         planned: planned.clone(),
         decision: TileCacheProbeDecision::Ready { tile, source },
         read_ms,
         decode_ms,
-        validation_mismatch: exact_validation == Some(TileCacheValidationOutcome::Mismatch),
-        exact_validation,
+        validation_mismatch: false,
+        corrupt_miss: false,
     })
 }
 
-fn write_empty_negative_tile_cache(
-    cache: &Arc<Mutex<TileCache>>,
+fn empty_negative_tile_cache_write(
     key: &TileCacheKey,
     planned: &PlannedTile,
     format: ImageFormat,
     validation_seed: u64,
-) -> Result<()> {
+) -> Option<TileCacheWrite> {
     if format != ImageFormat::FastRgbaZstd || validation_seed == 0 {
-        return Ok(());
+        return None;
     }
-    let Some(chunk_positions) = planned.chunk_positions.as_deref() else {
-        return Ok(());
-    };
+    let chunk_positions = planned.chunk_positions.as_deref()?;
     if !chunk_positions.is_empty() {
-        return Ok(());
+        return None;
     }
-    let rgba = vec![0_u8; fast_rgba_byte_len(planned.job.tile_size, planned.job.tile_size)?];
-    let validation_value =
-        tile_cache_validation_value(key, &planned.region, chunk_positions, validation_seed);
-    let encoded = encode_fast_rgba_zstd_with_validation_and_flags(
-        &rgba,
-        planned.job.tile_size,
-        planned.job.tile_size,
-        validation_value,
-        FAST_RGBA_ZSTD_FLAG_EMPTY_NEGATIVE,
-    )?;
-    cache
-        .lock()
-        .map_err(|_| BedrockRenderError::Validation("tile cache lock was poisoned".to_string()))?
-        .write_encoded(key, &encoded)
+    Some(TileCacheWrite {
+        key: key.clone(),
+        payload: TileCacheWritePayload::EmptyNegative {
+            tile_size: planned.job.tile_size,
+            region: planned.region,
+            validation_seed,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -5458,7 +6017,6 @@ where
 {
     source: Arc<dyn RenderChunkSource>,
     palette: RenderPalette,
-    chunk_bake_cache: Option<Arc<Mutex<ChunkBakeCache>>>,
     region_bake_cache: Option<Arc<Mutex<RegionBakeMemoryCache>>>,
     gpu: Option<GpuRenderContext>,
     _marker: PhantomData<fn() -> S>,
@@ -5483,7 +6041,6 @@ where
         Self {
             source,
             palette,
-            chunk_bake_cache: None,
             region_bake_cache: None,
             gpu: None,
             _marker: PhantomData,
@@ -5571,11 +6128,6 @@ where
             tile_chunk_index,
             bounds,
         })
-    }
-
-    fn with_chunk_bake_cache(mut self, cache: Arc<Mutex<ChunkBakeCache>>) -> Self {
-        self.chunk_bake_cache = Some(cache);
-        self
     }
 
     fn with_region_bake_cache(mut self, cache: Arc<Mutex<RegionBakeMemoryCache>>) -> Self {
@@ -6091,24 +6643,10 @@ where
         world_workers: usize,
     ) -> Result<RegionBake> {
         options.region_layout.validate()?;
-        let (cached_bakes, missing_positions, cache_stats) =
-            self.load_cached_chunk_bakes(chunk_positions, options, mode)?;
-        if missing_positions.is_empty() {
-            return self.bake_loaded_region_chunks_with_cached(
-                coord,
-                chunk_region,
-                Vec::new(),
-                None,
-                cached_bakes,
-                cache_stats,
-                options,
-                mode,
-            );
-        }
         let threading =
-            render_world_threading_with_budget(options, missing_positions.len(), world_workers);
+            render_world_threading_with_budget(options, chunk_positions.len(), world_workers);
         let (data, load_stats) = self.source.load_render_chunks_with_stats_blocking(
-            &missing_positions,
+            chunk_positions,
             RenderChunkLoadOptions {
                 request: render_chunk_request_for_options(mode, options),
                 subchunk_decode: SubChunkDecodeMode::FullIndices,
@@ -6124,8 +6662,6 @@ where
             chunk_region,
             data,
             Some(load_stats),
-            cached_bakes,
-            cache_stats,
             options,
             mode,
         )
@@ -6145,22 +6681,17 @@ where
             chunk_region,
             chunks,
             load_stats,
-            Vec::new(),
-            ChunkBakeCacheStats::default(),
             options,
             mode,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn bake_loaded_region_chunks_with_cached(
         &self,
         coord: RegionCoord,
         chunk_region: ChunkRegion,
         chunks: Vec<RenderChunkData>,
         load_stats: Option<RenderLoadStats>,
-        cached_bakes: Vec<ChunkBake>,
-        mut cache_stats: ChunkBakeCacheStats,
         options: &RenderOptions,
         mode: RenderMode,
     ) -> Result<RegionBake> {
@@ -6178,15 +6709,6 @@ where
         let mut chunks_copied = 0usize;
         let mut chunks_out_of_bounds = 0usize;
         let copy_started = Instant::now();
-        for bake in cached_bakes {
-            check_cancelled(options)?;
-            diagnostics.add(bake.diagnostics.clone());
-            if copy_chunk_bake_to_region_checked(&bake, &mut payload, base_region) {
-                chunks_copied = chunks_copied.saturating_add(1);
-            } else {
-                chunks_out_of_bounds = chunks_out_of_bounds.saturating_add(1);
-            }
-        }
         for chunk_data in chunks {
             check_cancelled(options)?;
             let bake = self.bake_chunk_data(
@@ -6197,9 +6719,6 @@ where
                 },
             )?;
             diagnostics.add(bake.diagnostics.clone());
-            if self.store_chunk_bake_cache(&bake, options)? {
-                cache_stats.writes = cache_stats.writes.saturating_add(1);
-            }
             if copy_chunk_bake_to_region_checked(&bake, &mut payload, base_region) {
                 chunks_copied = chunks_copied.saturating_add(1);
             } else {
@@ -6229,68 +6748,7 @@ where
             copy_ms,
             chunks_copied,
             chunks_out_of_bounds,
-            chunk_bake_cache_hits: cache_stats.hits,
-            chunk_bake_cache_misses: cache_stats.misses,
-            chunk_bake_cache_memory_hits: cache_stats.memory_hits,
-            chunk_bake_cache_disk_hits: cache_stats.disk_hits,
-            chunk_bake_cache_writes: cache_stats.writes,
         })
-    }
-
-    fn load_cached_chunk_bakes(
-        &self,
-        positions: &[ChunkPos],
-        options: &RenderOptions,
-        mode: RenderMode,
-    ) -> Result<(Vec<ChunkBake>, Vec<ChunkPos>, ChunkBakeCacheStats)> {
-        let mut stats = ChunkBakeCacheStats::default();
-        if !options.performance.sidecar_cache.uses_cache() {
-            return Ok((Vec::new(), positions.to_vec(), stats));
-        }
-        let Some(cache) = &self.chunk_bake_cache else {
-            return Ok((Vec::new(), positions.to_vec(), stats));
-        };
-        let mut cached = Vec::new();
-        let mut missing = Vec::new();
-        let mut cache = cache.lock().map_err(|_| {
-            BedrockRenderError::Validation("chunk bake cache lock was poisoned".to_string())
-        })?;
-        for pos in positions.iter().copied() {
-            match cache.get(
-                pos,
-                mode,
-                options.surface,
-                options.performance.sidecar_cache,
-            ) {
-                Some((bake, hit)) => {
-                    stats.record_hit(hit);
-                    cached.push(bake);
-                }
-                None => {
-                    stats.record_miss();
-                    missing.push(pos);
-                }
-            }
-        }
-        Ok((cached, missing, stats))
-    }
-
-    fn store_chunk_bake_cache(&self, bake: &ChunkBake, options: &RenderOptions) -> Result<bool> {
-        if !options.performance.sidecar_cache.uses_cache() {
-            return Ok(false);
-        }
-        let Some(cache) = &self.chunk_bake_cache else {
-            return Ok(false);
-        };
-        let mut cache = cache.lock().map_err(|_| {
-            BedrockRenderError::Validation("chunk bake cache lock was poisoned".to_string())
-        })?;
-        cache.insert(
-            bake.clone(),
-            options.surface,
-            options.performance.sidecar_cache,
-        )?;
-        Ok(true)
     }
 
     fn load_cached_region_bake(
@@ -6298,9 +6756,6 @@ where
         key: RegionBakeKey,
         options: &RenderOptions,
     ) -> Result<Option<RegionBake>> {
-        if !options.performance.sidecar_cache.uses_cache() {
-            return Ok(None);
-        }
         let Some(cache) = &self.region_bake_cache else {
             return Ok(None);
         };
@@ -6316,9 +6771,6 @@ where
         bake: &RegionBake,
         options: &RenderOptions,
     ) -> Result<()> {
-        if !options.performance.sidecar_cache.uses_cache() {
-            return Ok(());
-        }
         let Some(cache) = &self.region_bake_cache else {
             return Ok(());
         };
@@ -6625,13 +7077,6 @@ where
                 stats.region_chunks_out_of_bounds = stats
                     .region_chunks_out_of_bounds
                     .saturating_add(region.chunks_out_of_bounds);
-                stats.add_chunk_bake_cache_stats(ChunkBakeCacheStats {
-                    hits: region.chunk_bake_cache_hits,
-                    misses: region.chunk_bake_cache_misses,
-                    memory_hits: region.chunk_bake_cache_memory_hits,
-                    disk_hits: region.chunk_bake_cache_disk_hits,
-                    writes: region.chunk_bake_cache_writes,
-                });
                 stats.baked_chunks = diagnostics.baked_chunks;
                 if region_bake_covers_full_region(&region, options.region_layout) {
                     self.store_region_bake_cache(key, &region, options)?;
@@ -6737,7 +7182,7 @@ where
                 coord: job.coord,
                 width: job.tile_size,
                 height: job.tile_size,
-                rgba,
+                rgba: Arc::<[u8]>::from(rgba),
                 encoded,
             },
             stats,
@@ -6884,7 +7329,7 @@ where
             coord: job.coord,
             width: job.tile_size,
             height: job.tile_size,
-            rgba,
+            rgba: Arc::<[u8]>::from(rgba),
             encoded,
         })
     }
@@ -8355,36 +8800,6 @@ fn mode_slug(mode: RenderMode) -> String {
         RenderMode::RawHeightMap => "raw-heightmap".to_string(),
         RenderMode::CaveSlice { y } => format!("cave-y{y}"),
     }
-}
-
-fn mode_from_slug(slug: &str) -> Option<RenderMode> {
-    if slug == "surface" {
-        return Some(RenderMode::SurfaceBlocks);
-    }
-    if slug == "heightmap" {
-        return Some(RenderMode::HeightMap);
-    }
-    if slug == "raw-heightmap" {
-        return Some(RenderMode::RawHeightMap);
-    }
-    slug.strip_prefix("biome-y")
-        .and_then(|value| value.parse::<i32>().ok())
-        .map(|y| RenderMode::Biome { y })
-        .or_else(|| {
-            slug.strip_prefix("raw-biome-y")
-                .and_then(|value| value.parse::<i32>().ok())
-                .map(|y| RenderMode::RawBiomeLayer { y })
-        })
-        .or_else(|| {
-            slug.strip_prefix("layer-y")
-                .and_then(|value| value.parse::<i32>().ok())
-                .map(|y| RenderMode::LayerBlocks { y })
-        })
-        .or_else(|| {
-            slug.strip_prefix("cave-y")
-                .and_then(|value| value.parse::<i32>().ok())
-                .map(|y| RenderMode::CaveSlice { y })
-        })
 }
 
 fn surface_options_hash(surface: SurfaceRenderOptions) -> u64 {
@@ -10783,8 +11198,11 @@ fn should_process_tile_on_gpu(options: &RenderOptions, tile_size: u32, work_item
         return false;
     }
     let effective_items = work_items.max(1);
-    let auto_batch_pixels = tile_pixels.saturating_mul(4);
-    let batch_pixels = options.gpu.batch_pixels.max(auto_batch_pixels);
+    let batch_pixels = if options.gpu.batch_pixels == 0 {
+        tile_pixels.saturating_mul(4)
+    } else {
+        options.gpu.batch_pixels
+    };
     tile_pixels.saturating_mul(effective_items) >= batch_pixels
 }
 
@@ -12061,6 +12479,30 @@ fn encode_image(
     }
 }
 
+fn rgba_to_bgra(mut rgba: Vec<u8>) -> Vec<u8> {
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    rgba
+}
+
+fn decoded_tile_from_tile_image(
+    tile: TileImage,
+    output: RenderTileOutputOptions,
+) -> DecodedTileImage {
+    let pixels = match output.pixel_format {
+        TilePixelFormat::Rgba8 => tile.rgba,
+        TilePixelFormat::Bgra8 => Arc::from(rgba_to_bgra(tile.rgba.as_ref().to_vec())),
+    };
+    DecodedTileImage {
+        coord: tile.coord,
+        width: tile.width,
+        height: tile.height,
+        pixels,
+        pixel_format: output.pixel_format,
+    }
+}
+
 /// Encodes raw RGBA tile bytes into the fast zstd-backed tile cache format.
 ///
 /// # Errors
@@ -12116,6 +12558,23 @@ fn encode_fast_rgba_zstd_with_validation_and_flags(
     )
 }
 
+fn encode_fast_rgba_zstd_empty_negative(
+    width: u32,
+    height: u32,
+    validation_value: u64,
+) -> Result<Vec<u8>> {
+    let expected_len = fast_rgba_byte_len(width, height)?;
+    encode_fast_rgba_zstd_header(
+        width,
+        height,
+        expected_len,
+        FAST_RGBA_ZSTD_VALIDATION_KIND_SIMPLE_TILE,
+        FAST_RGBA_ZSTD_FLAG_EMPTY_NEGATIVE,
+        validation_value,
+        0,
+    )
+}
+
 fn encode_fast_rgba_zstd_inner(
     rgba: &[u8],
     width: u32,
@@ -12127,30 +12586,51 @@ fn encode_fast_rgba_zstd_inner(
     let expected_len = fast_rgba_byte_len(width, height)?;
     if rgba.len() != expected_len {
         return Err(BedrockRenderError::Validation(format!(
-            "fast RGBA tile buffer length mismatch: expected {expected_len}, got {}",
+            "fast tile buffer length mismatch: expected {expected_len}, got {}",
             rgba.len()
         )));
     }
 
     let compressed = zstd::bulk::compress(rgba, FAST_RGBA_ZSTD_LEVEL)
-        .map_err(|error| BedrockRenderError::io("failed to encode zstd RGBA tile", error))?;
+        .map_err(|error| BedrockRenderError::io("failed to encode zstd tile", error))?;
+    let mut output = encode_fast_rgba_zstd_header(
+        width,
+        height,
+        expected_len,
+        validation_kind,
+        flags,
+        validation_value,
+        compressed.len(),
+    )?;
+    output.extend_from_slice(&compressed);
+    Ok(output)
+}
+
+fn encode_fast_rgba_zstd_header(
+    width: u32,
+    height: u32,
+    rgba_len: usize,
+    validation_kind: u32,
+    flags: u32,
+    validation_value: u64,
+    payload_len: usize,
+) -> Result<Vec<u8>> {
     validate_fast_rgba_flags(flags)?;
-    let mut output = Vec::with_capacity(FAST_RGBA_ZSTD_HEADER_LEN.saturating_add(compressed.len()));
+    let mut output = Vec::with_capacity(FAST_RGBA_ZSTD_HEADER_LEN.saturating_add(payload_len));
     output.extend_from_slice(FAST_RGBA_ZSTD_MAGIC);
     output.extend_from_slice(&FAST_RGBA_ZSTD_VERSION.to_le_bytes());
     output.extend_from_slice(&width.to_le_bytes());
     output.extend_from_slice(&height.to_le_bytes());
     output.extend_from_slice(
-        &u64::try_from(expected_len)
+        &u64::try_from(rgba_len)
             .map_err(|_| {
-                BedrockRenderError::Validation("fast RGBA tile length is too large".to_string())
+                BedrockRenderError::Validation("fast tile length is too large".to_string())
             })?
             .to_le_bytes(),
     );
     output.extend_from_slice(&validation_kind.to_le_bytes());
     output.extend_from_slice(&flags.to_le_bytes());
     output.extend_from_slice(&validation_value.to_le_bytes());
-    output.extend_from_slice(&compressed);
     Ok(output)
 }
 
@@ -12213,27 +12693,8 @@ fn encode_fast_rgba_zstd_v1_for_test(rgba: &[u8], width: u32, height: u32) -> Re
 /// decompression fails.
 pub fn decode_fast_rgba_zstd(bytes: &[u8]) -> Result<FastRgbaZstdTile> {
     let header = decode_fast_rgba_zstd_header(bytes)?;
-    let expected_len = usize::try_from(header.rgba_len).map_err(|_| {
-        BedrockRenderError::Validation(format!(
-            "fast RGBA tile byte length does not fit usize: {}",
-            header.rgba_len
-        ))
-    })?;
-
-    let rgba = zstd::bulk::decompress(&bytes[header.header_len..], expected_len)
-        .map_err(|error| BedrockRenderError::io("failed to decode zstd RGBA tile", error))?;
-    if rgba.len() != expected_len {
-        return Err(BedrockRenderError::Validation(format!(
-            "fast RGBA tile decoded length mismatch: expected {expected_len}, got {}",
-            rgba.len()
-        )));
-    }
-    Ok(FastRgbaZstdTile {
-        width: header.width,
-        height: header.height,
-        validation_value: header.validation_value,
-        rgba,
-    })
+    let mut scratch = TileCacheDecodeScratch::new();
+    decode_fast_rgba_zstd_with_header(bytes, header, &mut scratch)
 }
 
 /// Decodes only the header from a fast zstd-backed tile cache entry.
@@ -12244,12 +12705,12 @@ pub fn decode_fast_rgba_zstd(bytes: &[u8]) -> Result<FastRgbaZstdTile> {
 pub fn decode_fast_rgba_zstd_header(bytes: &[u8]) -> Result<FastRgbaZstdHeader> {
     if bytes.len() < FAST_RGBA_ZSTD_V1_HEADER_LEN {
         return Err(BedrockRenderError::Validation(
-            "fast RGBA tile cache entry is truncated".to_string(),
+            "fast tile cache entry is truncated".to_string(),
         ));
     }
     if &bytes[..FAST_RGBA_ZSTD_MAGIC.len()] != FAST_RGBA_ZSTD_MAGIC {
         return Err(BedrockRenderError::Validation(
-            "fast RGBA tile cache entry has an invalid magic".to_string(),
+            "fast tile cache entry has an invalid magic".to_string(),
         ));
     }
 
@@ -12264,7 +12725,7 @@ pub fn decode_fast_rgba_zstd_header(bytes: &[u8]) -> Result<FastRgbaZstdHeader> 
         })?
     {
         return Err(BedrockRenderError::Validation(format!(
-            "fast RGBA tile payload length mismatch: expected {expected_len}, got {stored_len}"
+            "fast tile payload length mismatch: expected {expected_len}, got {stored_len}"
         )));
     }
 
@@ -12282,21 +12743,12 @@ pub fn decode_fast_rgba_zstd_header(bytes: &[u8]) -> Result<FastRgbaZstdHeader> 
         FAST_RGBA_ZSTD_VERSION => {
             if bytes.len() < FAST_RGBA_ZSTD_HEADER_LEN {
                 return Err(BedrockRenderError::Validation(
-                    "fast RGBA v2 tile cache entry header is truncated".to_string(),
+                    "fast v2 tile cache entry header is truncated".to_string(),
                 ));
             }
             let validation_kind = read_le_u32(bytes, 24)?;
             let flags = read_le_u32(bytes, 28)?;
-            if flags & !FAST_RGBA_ZSTD_KNOWN_FLAGS != 0 {
-                return Err(BedrockRenderError::Validation(format!(
-                    "unsupported fast RGBA tile flags {flags:#x}"
-                )));
-            }
-            if flags & FAST_RGBA_ZSTD_KNOWN_FLAGS == FAST_RGBA_ZSTD_KNOWN_FLAGS {
-                return Err(BedrockRenderError::Validation(
-                    "fast RGBA tile cannot be both non-empty and empty".to_string(),
-                ));
-            }
+            validate_fast_rgba_flags(flags)?;
             let validation_value = read_le_u64(bytes, 32)?;
             let validation_value = match validation_kind {
                 FAST_RGBA_ZSTD_VALIDATION_KIND_NONE => None,
@@ -12319,9 +12771,72 @@ pub fn decode_fast_rgba_zstd_header(bytes: &[u8]) -> Result<FastRgbaZstdHeader> 
             })
         }
         _ => Err(BedrockRenderError::Validation(format!(
-            "unsupported fast RGBA tile cache version {version}"
+            "unsupported fast tile cache version {version}"
         ))),
     }
+}
+
+fn decode_fast_rgba_zstd_pixels_with_header(
+    bytes: &[u8],
+    header: FastRgbaZstdHeader,
+    scratch: &mut TileCacheDecodeScratch,
+) -> Result<Vec<u8>> {
+    let expected_len = usize::try_from(header.rgba_len).map_err(|_| {
+        BedrockRenderError::Validation(format!(
+            "fast tile byte length does not fit usize: {}",
+            header.rgba_len
+        ))
+    })?;
+
+    let pixels = scratch.decompress_to_vec(&bytes[header.header_len..], expected_len)?;
+    if pixels.len() != expected_len {
+        return Err(BedrockRenderError::Validation(format!(
+            "fast tile decoded length mismatch: expected {expected_len}, got {}",
+            pixels.len()
+        )));
+    }
+    Ok(pixels)
+}
+
+fn decode_fast_rgba_zstd_pixels_arc_with_header(
+    bytes: &[u8],
+    header: FastRgbaZstdHeader,
+    scratch: &mut TileCacheDecodeScratch,
+) -> Result<Arc<[u8]>> {
+    let expected_len = usize::try_from(header.rgba_len).map_err(|_| {
+        BedrockRenderError::Validation(format!(
+            "fast tile byte length does not fit usize: {}",
+            header.rgba_len
+        ))
+    })?;
+    scratch.decompress_to_arc(&bytes[header.header_len..], expected_len)
+}
+
+fn decode_fast_rgba_zstd_with_header(
+    bytes: &[u8],
+    header: FastRgbaZstdHeader,
+    scratch: &mut TileCacheDecodeScratch,
+) -> Result<FastRgbaZstdTile> {
+    let rgba = decode_fast_rgba_zstd_pixels_with_header(bytes, header, scratch)?;
+    Ok(FastRgbaZstdTile {
+        width: header.width,
+        height: header.height,
+        validation_value: header.validation_value,
+        rgba,
+    })
+}
+
+fn decode_fast_rgba_zstd_shared_with_header(
+    bytes: &[u8],
+    header: FastRgbaZstdHeader,
+    scratch: &mut TileCacheDecodeScratch,
+) -> Result<FastRgbaZstdSharedTile> {
+    let rgba = decode_fast_rgba_zstd_pixels_arc_with_header(bytes, header, scratch)?;
+    Ok(FastRgbaZstdSharedTile {
+        width: header.width,
+        height: header.height,
+        rgba,
+    })
 }
 
 fn fast_rgba_byte_len(width: u32, height: u32) -> Result<usize> {
@@ -12449,6 +12964,56 @@ mod tests {
         block_storage_index,
     };
     use indexmap::IndexMap;
+    use std::fs;
+
+    #[test]
+    fn decoded_rgba_tile_image_reuses_shared_payload() {
+        let pixels = Arc::<[u8]>::from([1, 2, 3, 255]);
+        let tile = TileImage {
+            coord: TileCoord {
+                x: 0,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            width: 1,
+            height: 1,
+            rgba: pixels.clone(),
+            encoded: None,
+        };
+        let decoded = decoded_tile_from_tile_image(
+            tile,
+            RenderTileOutputOptions {
+                pixel_format: TilePixelFormat::Rgba8,
+            },
+        );
+
+        assert!(Arc::ptr_eq(&decoded.pixels, &pixels));
+    }
+
+    #[test]
+    fn decoded_bgra_tile_image_freezes_converted_pixels() {
+        let pixels = Arc::<[u8]>::from([1, 2, 3, 255]);
+        let tile = TileImage {
+            coord: TileCoord {
+                x: 0,
+                z: 0,
+                dimension: Dimension::Overworld,
+            },
+            width: 1,
+            height: 1,
+            rgba: pixels.clone(),
+            encoded: None,
+        };
+        let decoded = decoded_tile_from_tile_image(
+            tile,
+            RenderTileOutputOptions {
+                pixel_format: TilePixelFormat::Bgra8,
+            },
+        );
+
+        assert!(!Arc::ptr_eq(&decoded.pixels, &pixels));
+        assert_eq!(decoded.pixels.as_ref(), &[3, 2, 1, 255]);
+    }
 
     fn cardinal_heights(west: i16, east: i16, north: i16, south: i16) -> TerrainHeightNeighborhood {
         fn average(first: i16, second: i16) -> i16 {
@@ -12535,7 +13100,7 @@ mod tests {
             job,
             region,
             layout,
-            chunk_positions: Some(chunks),
+            chunk_positions: Some(Arc::<[ChunkPos]>::from(chunks)),
         }
     }
 
@@ -12655,6 +13220,41 @@ mod tests {
             tile_z: planned.job.coord.z,
             extension: image_format_extension(ImageFormat::FastRgbaZstd).to_string(),
         }
+    }
+
+    fn authority_snapshots_for_test(
+        cache: &Arc<Mutex<TileCache>>,
+        key: &TileCacheKey,
+    ) -> BTreeMap<TileAuthorityCacheKey, TileAuthoritySnapshotState> {
+        let authority_key = tile_authority_cache_key_from_tile_key(key);
+        let snapshot = cache
+            .lock()
+            .expect("cache lock")
+            .load_authority_snapshot(&authority_key)
+            .expect("load authority snapshot");
+        let snapshot = snapshot.map_or(TileAuthoritySnapshotState::Missing, |snapshot| {
+            TileAuthoritySnapshotState::Ready(snapshot)
+        });
+        BTreeMap::from([(authority_key, snapshot)])
+    }
+
+    fn blob_readers_for_test(
+        cache: &Arc<Mutex<TileCache>>,
+        key: &TileCacheKey,
+    ) -> BTreeMap<TileAuthorityCacheKey, TileAuthorityBlobReaderState> {
+        let authority_key = tile_authority_cache_key_from_tile_key(key);
+        open_tile_authority_blob_readers_for_batch(
+            cache,
+            &BTreeMap::from([(
+                authority_key.clone(),
+                TileAuthoritySnapshotState::Ready(Arc::new(TileAuthorityIndexSnapshot::default())),
+            )]),
+        )
+        .expect("open blob readers")
+    }
+
+    fn session_tile_memory_for_test(limit: usize) -> Arc<Mutex<SessionTileMemoryIndex>> {
+        Arc::new(Mutex::new(SessionTileMemoryIndex::new(limit)))
     }
 
     #[test]
@@ -12886,7 +13486,7 @@ mod tests {
     }
 
     #[test]
-    fn max_speed_interactive_enables_hint_sidecar_cpu_and_preview_policy() {
+    fn max_speed_interactive_enables_hint_cpu_preview_and_tile_cache_policy() {
         let options = RenderOptions::max_speed_interactive();
         assert_eq!(options.backend, RenderBackend::Cpu);
         assert_eq!(
@@ -12899,10 +13499,6 @@ mod tests {
             RenderPerformanceProfile::MaxSpeed
         );
         assert!(options.performance.progressive_preview);
-        assert_eq!(
-            options.performance.sidecar_cache,
-            RenderSidecarCachePolicy::Persistent
-        );
         assert_eq!(
             options.performance.surface_load,
             RenderSurfaceLoadPolicy::HintThenVerify
@@ -12921,71 +13517,19 @@ mod tests {
         );
         assert!(!options.performance.progressive_preview);
         assert_eq!(
-            options.performance.sidecar_cache,
-            RenderSidecarCachePolicy::Persistent
-        );
-        assert_eq!(
             options.performance.surface_load,
             RenderSurfaceLoadPolicy::HintThenVerify
         );
     }
 
     #[test]
-    fn max_speed_session_config_uses_sidecar_cache_metadata() {
+    fn max_speed_session_config_uses_final_tile_cache_metadata() {
         let config = MapRenderSessionConfig::max_speed("cache-root", "world-a", "sig-a");
         assert_eq!(config.cache_root, PathBuf::from("cache-root"));
         assert_eq!(config.world_id, "world-a");
         assert_eq!(config.world_signature, "sig-a");
-        assert!(config.chunk_bake_cache_memory_limit >= 4096);
         assert!(config.region_bake_cache_memory_limit >= 128);
         assert!(config.cull_missing_chunks);
-    }
-
-    #[test]
-    fn chunk_bake_sidecar_round_trips_surface_payload() {
-        let pos = ChunkPos {
-            x: 3,
-            z: -2,
-            dimension: Dimension::Overworld,
-        };
-        let mut surface = SurfacePlane {
-            colors: RgbaPlane::new(16, 16, RgbaColor::new(1, 2, 3, 255)).expect("colors"),
-            heights: HeightPlane::new(16, 16).expect("heights"),
-            relief_heights: HeightPlane::new(16, 16).expect("relief"),
-            water_depths: DepthPlane::new(16, 16).expect("depths"),
-        };
-        surface.colors.set_color(4, 5, RgbaColor::new(9, 8, 7, 255));
-        surface.heights.set_height(4, 5, 70);
-        surface.relief_heights.set_height(4, 5, 64);
-        surface.water_depths.set_depth(4, 5, 3);
-        let bake = ChunkBake {
-            pos,
-            mode: RenderMode::SurfaceBlocks,
-            payload: ChunkBakePayload::Surface(surface),
-            diagnostics: RenderDiagnostics::default(),
-        };
-        let bytes = encode_chunk_bake(&bake);
-        let key = ChunkBakeCacheKey {
-            world_id: "world".to_string(),
-            world_signature: "sig".to_string(),
-            renderer_version: RENDERER_CACHE_VERSION,
-            palette_version: DEFAULT_PALETTE_VERSION,
-            dimension: pos.dimension,
-            mode: mode_slug(RenderMode::SurfaceBlocks),
-            surface_hash: surface_options_hash(SurfaceRenderOptions::default()),
-            chunk_x: pos.x,
-            chunk_z: pos.z,
-        };
-        let decoded = decode_chunk_bake(&bytes, &key).expect("decode cache");
-        assert_eq!(decoded.pos, pos);
-        assert_eq!(decoded.mode, RenderMode::SurfaceBlocks);
-        assert_eq!(
-            chunk_bake_color(&decoded, 4, 5).expect("color").to_array(),
-            [9, 8, 7, 255]
-        );
-        assert_eq!(chunk_bake_height(&decoded, 4, 5), Some(70));
-        assert_eq!(chunk_bake_relief_height(&decoded, 4, 5), Some(64));
-        assert_eq!(chunk_bake_water_depth(&decoded, 4, 5), 3);
     }
 
     #[test]
@@ -13021,11 +13565,6 @@ mod tests {
             copy_ms: 0,
             chunks_copied: 0,
             chunks_out_of_bounds: 0,
-            chunk_bake_cache_hits: 0,
-            chunk_bake_cache_misses: 0,
-            chunk_bake_cache_memory_hits: 0,
-            chunk_bake_cache_disk_hits: 0,
-            chunk_bake_cache_writes: 0,
         };
         let mut cache =
             RegionBakeMemoryCache::new(4, RENDERER_CACHE_VERSION, DEFAULT_PALETTE_VERSION);
@@ -13076,11 +13615,6 @@ mod tests {
             copy_ms: 0,
             chunks_copied: 0,
             chunks_out_of_bounds: 0,
-            chunk_bake_cache_hits: 0,
-            chunk_bake_cache_misses: 0,
-            chunk_bake_cache_memory_hits: 0,
-            chunk_bake_cache_disk_hits: 0,
-            chunk_bake_cache_writes: 0,
         };
         if let RegionBakePayload::SurfaceAtlas(surface) = &mut region.payload {
             surface
@@ -13399,11 +13933,6 @@ mod tests {
             copy_ms: 0,
             chunks_copied: first_plan.chunk_positions.len(),
             chunks_out_of_bounds: 0,
-            chunk_bake_cache_hits: 0,
-            chunk_bake_cache_misses: 0,
-            chunk_bake_cache_memory_hits: 0,
-            chunk_bake_cache_disk_hits: 0,
-            chunk_bake_cache_writes: 0,
         };
 
         assert!(region_bake_covers_plan(&partial_region, &first_plan));
@@ -13480,11 +14009,6 @@ mod tests {
             copy_ms: 0,
             chunks_copied: first_plan.chunk_positions.len(),
             chunks_out_of_bounds: 0,
-            chunk_bake_cache_hits: 0,
-            chunk_bake_cache_misses: 0,
-            chunk_bake_cache_memory_hits: 0,
-            chunk_bake_cache_disk_hits: 0,
-            chunk_bake_cache_writes: 0,
         };
         let mut regions = BTreeMap::new();
         regions.insert(first_plan.key, partial_region);
@@ -18002,7 +18526,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_cache_key_changes_with_world_signature_and_layout() {
+    fn tile_cache_authority_key_changes_with_world_signature_and_layout() {
         let base = TileCacheKey {
             world_id: "world".to_string(),
             world_signature: "a".to_string(),
@@ -18017,8 +18541,6 @@ mod tests {
             tile_z: 0,
             extension: "webp".to_string(),
         };
-        let cache = TileCache::new("cache", 4);
-        let signature_path = cache.path_for_key(&base);
         let mut changed_signature = base.clone();
         changed_signature.world_signature = "b".to_string();
         let mut changed_layout = base.clone();
@@ -18026,9 +18548,19 @@ mod tests {
         let mut changed_pixel_scale = base.clone();
         changed_pixel_scale.pixels_per_block = 2;
 
-        assert_ne!(signature_path, cache.path_for_key(&changed_signature));
-        assert_ne!(signature_path, cache.path_for_key(&changed_layout));
-        assert_ne!(signature_path, cache.path_for_key(&changed_pixel_scale));
+        let base = tile_authority_cache_key_from_tile_key(&base);
+        assert_ne!(
+            base.validation_value(),
+            tile_authority_cache_key_from_tile_key(&changed_signature).validation_value()
+        );
+        assert_ne!(
+            base.validation_value(),
+            tile_authority_cache_key_from_tile_key(&changed_layout).validation_value()
+        );
+        assert_ne!(
+            base.validation_value(),
+            tile_authority_cache_key_from_tile_key(&changed_pixel_scale).validation_value()
+        );
     }
 
     #[test]
@@ -18084,6 +18616,21 @@ mod tests {
     }
 
     #[test]
+    fn fast_rgba_zstd_empty_negative_can_be_header_only() {
+        let encoded =
+            encode_fast_rgba_zstd_empty_negative(2, 2, 0x66).expect("encode header-only negative");
+        let header =
+            decode_fast_rgba_zstd_header(&encoded).expect("decode header-only negative header");
+
+        assert_eq!(encoded.len(), FAST_RGBA_ZSTD_HEADER_LEN);
+        assert!(header.is_empty_negative());
+        assert!(!header.is_non_empty());
+        assert_eq!(header.rgba_len, 16);
+        assert_eq!(header.validation_value, Some(0x66));
+        assert!(decode_fast_rgba_zstd(&encoded).is_err());
+    }
+
+    #[test]
     fn fast_rgba_zstd_v1_decodes_without_validation() {
         let rgba = vec![0, 1, 2, 255, 3, 4, 5, 255, 6, 7, 8, 255, 9, 10, 11, 255];
         let encoded = encode_fast_rgba_zstd_v1_for_test(&rgba, 2, 2).expect("encode v1");
@@ -18111,11 +18658,11 @@ mod tests {
     #[test]
     fn fast_rgba_cache_rejects_transparent_legacy_v2_for_non_empty_chunks() {
         let mut planned = planned_tile_at(0, 0);
-        planned.chunk_positions = Some(vec![ChunkPos {
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(vec![ChunkPos {
             x: 0,
             z: 0,
             dimension: Dimension::Overworld,
-        }]);
+        }]));
         let key = tile_cache_key_for_test(&planned);
         let validation_value = tile_cache_validation_value(
             &key,
@@ -18149,7 +18696,7 @@ mod tests {
     #[test]
     fn fast_rgba_cache_accepts_empty_negative_only_for_empty_chunk_set() {
         let mut planned = planned_tile_at(0, 0);
-        planned.chunk_positions = Some(Vec::new());
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(Vec::new()));
         let key = tile_cache_key_for_test(&planned);
         let validation_value = tile_cache_validation_value(
             &key,
@@ -18174,6 +18721,81 @@ mod tests {
             tile_cache_entry_decision(&encoded, &key, &planned, ImageFormat::FastRgbaZstd, 11)
                 .expect("cache decision"),
             TileCacheEntryDecision::EmptyNegative
+        );
+    }
+
+    #[test]
+    fn fast_rgba_cache_accepts_header_only_empty_negative() {
+        let mut planned = planned_tile_at(0, 0);
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(Vec::new()));
+        let key = tile_cache_key_for_test(&planned);
+        let validation_value = tile_cache_validation_value(
+            &key,
+            &planned.region,
+            planned.chunk_positions.as_deref().expect("chunk positions"),
+            19,
+        );
+        let encoded = encode_fast_rgba_zstd_empty_negative(
+            planned.job.tile_size,
+            planned.job.tile_size,
+            validation_value,
+        )
+        .expect("encode header-only negative");
+
+        assert_eq!(
+            tile_cache_entry_decision(&encoded, &key, &planned, ImageFormat::FastRgbaZstd, 19)
+                .expect("cache decision"),
+            TileCacheEntryDecision::EmptyNegative
+        );
+    }
+
+    #[test]
+    fn empty_negative_cache_write_payload_is_header_only() {
+        let mut planned = planned_tile_at(0, 0);
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(Vec::new()));
+        let key = tile_cache_key_for_test(&planned);
+        let empty_payload = TileCacheWritePayload::EmptyNegative {
+            tile_size: planned.job.tile_size,
+            region: planned.region,
+            validation_seed: 23,
+        };
+        let encoded = encode_tile_cache_write_payload(&key, &empty_payload)
+            .expect("encode empty negative payload");
+        let header = decode_fast_rgba_zstd_header(&encoded).expect("decode header-only negative");
+
+        assert_eq!(encoded.len(), FAST_RGBA_ZSTD_HEADER_LEN);
+        assert!(header.is_empty_negative());
+        assert_eq!(
+            header.validation_value,
+            Some(tile_cache_validation_value(&key, &planned.region, &[], 23))
+        );
+
+        let rgba = Arc::<[u8]>::from(vec![
+            0;
+            fast_rgba_byte_len(
+                planned.job.tile_size,
+                planned.job.tile_size
+            )
+            .expect("tile byte length")
+        ]);
+        let fast_payload = TileCacheWritePayload::FastRgbaZstd {
+            rgba,
+            width: planned.job.tile_size,
+            height: planned.job.tile_size,
+            region: planned.region,
+            chunk_positions: Arc::<[ChunkPos]>::from(Vec::new()),
+            validation_seed: 23,
+            flags: FAST_RGBA_ZSTD_FLAG_EMPTY_NEGATIVE,
+        };
+        let encoded = encode_tile_cache_write_payload(&key, &fast_payload)
+            .expect("encode flagged empty negative payload");
+        let header = decode_fast_rgba_zstd_header(&encoded).expect("decode flagged empty negative");
+
+        assert_eq!(encoded.len(), FAST_RGBA_ZSTD_HEADER_LEN);
+        assert!(header.is_empty_negative());
+        assert_eq!(
+            header.validation_value,
+            Some(tile_cache_validation_value(&key, &planned.region, &[], 23))
         );
     }
 
@@ -18204,7 +18826,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_disk_cache_is_ready_optimistically_before_exact_outcome() {
+    fn validated_disk_cache_is_ready_from_disk() {
         let cache_root = std::env::temp_dir().join(format!(
             "bedrock-render-optimistic-cache-{}",
             TILE_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
@@ -18214,11 +18836,11 @@ mod tests {
         }
         let cache = Arc::new(Mutex::new(TileCache::new(cache_root.clone(), 4)));
         let mut planned = planned_tile_at(0, 0);
-        planned.chunk_positions = Some(vec![ChunkPos {
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(vec![ChunkPos {
             x: 0,
             z: 0,
             dimension: Dimension::Overworld,
-        }]);
+        }]));
         let key = tile_cache_key_for_test(&planned);
         let validation_value = tile_cache_validation_value(
             &key,
@@ -18245,18 +18867,338 @@ mod tests {
             .write_encoded(&key, &encoded)
             .expect("write cache");
 
-        let probe = resolve_tile_cache_entry(&cache, &key, &planned, ImageFormat::FastRgbaZstd, 17)
-            .expect("probe cache");
-        assert_eq!(
-            probe.exact_validation,
-            Some(TileCacheValidationOutcome::Valid)
-        );
+        let mut scratch = TileCacheDecodeScratch::new();
+        let authority_snapshots = authority_snapshots_for_test(&cache, &key);
+        let blob_readers = blob_readers_for_test(&cache, &key);
+        let session_memory = session_tile_memory_for_test(4);
+        let probe = resolve_tile_cache_entry(
+            &cache,
+            &session_memory,
+            &authority_snapshots,
+            &blob_readers,
+            &key,
+            &key,
+            &planned,
+            ImageFormat::FastRgbaZstd,
+            17,
+            &mut scratch,
+        )
+        .expect("probe cache");
         match probe.decision {
             TileCacheProbeDecision::Ready { source, .. } => {
-                assert_eq!(source, TileReadySource::DiskCacheOptimistic);
+                assert_eq!(source, TileReadySource::DiskCacheFresh);
             }
-            _ => panic!("expected optimistic ready tile"),
+            _ => panic!("expected ready tile"),
         }
+        let probe = resolve_tile_cache_entry(
+            &cache,
+            &session_memory,
+            &authority_snapshots,
+            &blob_readers,
+            &key,
+            &key,
+            &planned,
+            ImageFormat::FastRgbaZstd,
+            17,
+            &mut scratch,
+        )
+        .expect("probe session memory");
+        match probe.decision {
+            TileCacheProbeDecision::Ready { source, .. } => {
+                assert_eq!(source, TileReadySource::MemoryCache);
+                assert_eq!(probe.read_ms, 0);
+                assert_eq!(probe.decode_ms, 0);
+            }
+            _ => panic!("expected memory ready tile"),
+        }
+        fs::remove_dir_all(cache_root).ok();
+    }
+
+    #[test]
+    fn authority_empty_negative_cache_is_ready_from_disk() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "bedrock-render-empty-authority-cache-{}",
+            TILE_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        if cache_root.exists() {
+            fs::remove_dir_all(&cache_root).expect("remove stale test cache");
+        }
+        let cache = Arc::new(Mutex::new(TileCache::new(cache_root.clone(), 4)));
+        let mut planned = planned_tile_at(0, 0);
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(Vec::new()));
+        let key = tile_cache_key_for_test(&planned);
+        let validation_value = tile_cache_validation_value(&key, &planned.region, &[], 23);
+        let encoded = encode_fast_rgba_zstd_empty_negative(
+            planned.job.tile_size,
+            planned.job.tile_size,
+            validation_value,
+        )
+        .expect("encode empty cache tile");
+        cache
+            .lock()
+            .expect("cache lock")
+            .write_encoded(&key, &encoded)
+            .expect("write empty cache");
+
+        let mut scratch = TileCacheDecodeScratch::new();
+        let authority_snapshots = authority_snapshots_for_test(&cache, &key);
+        let blob_readers = blob_readers_for_test(&cache, &key);
+        let session_memory = session_tile_memory_for_test(4);
+        let probe = resolve_tile_cache_entry(
+            &cache,
+            &session_memory,
+            &authority_snapshots,
+            &blob_readers,
+            &key,
+            &key,
+            &planned,
+            ImageFormat::FastRgbaZstd,
+            23,
+            &mut scratch,
+        )
+        .expect("probe cache");
+        assert!(matches!(
+            probe.decision,
+            TileCacheProbeDecision::EmptyNegative
+        ));
+        fs::remove_dir_all(cache_root).ok();
+    }
+
+    #[test]
+    fn authority_cache_write_records_tile_dependencies() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "bedrock-render-authority-deps-{}",
+            TILE_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        if cache_root.exists() {
+            fs::remove_dir_all(&cache_root).expect("remove stale test cache");
+        }
+        let cache = TileCache::new(cache_root.clone(), 4);
+        let mut planned = planned_tile_at(0, 0);
+        let chunk_pos = ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        };
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(vec![chunk_pos]));
+        let key = tile_cache_key_for_test(&planned);
+        let validation_value = tile_cache_validation_value(
+            &key,
+            &planned.region,
+            planned.chunk_positions.as_deref().expect("chunk positions"),
+            29,
+        );
+        let mut rgba = vec![
+            0;
+            fast_rgba_byte_len(planned.job.tile_size, planned.job.tile_size)
+                .expect("tile byte length")
+        ];
+        rgba[3] = 255;
+        let encoded = encode_fast_rgba_zstd_with_validation(
+            &rgba,
+            planned.job.tile_size,
+            planned.job.tile_size,
+            validation_value,
+        )
+        .expect("encode tile");
+        cache
+            .write_fast_rgba_zstd_entry(
+                &key,
+                &encoded,
+                Some(planned.region),
+                planned.chunk_positions.as_deref(),
+                29,
+            )
+            .expect("write authority cache");
+
+        let authority_key = tile_authority_cache_key_from_tile_key(&key);
+        let snapshot = cache
+            .authority
+            .load_index(&authority_key)
+            .expect("load authority index")
+            .expect("authority index exists");
+        assert_eq!(snapshot.tiles.len(), 1);
+        assert_eq!(snapshot.dependencies.len(), 1);
+        assert_eq!(snapshot.dependencies[0].position, chunk_pos);
+        assert_eq!(snapshot.chunk_tile_refs.len(), 1);
+        assert_eq!(snapshot.chunk_tile_refs[0].position, chunk_pos);
+        fs::remove_dir_all(cache_root).ok();
+    }
+
+    #[test]
+    fn authority_cache_write_rebuilds_after_corrupt_index() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "bedrock-render-authority-rebuild-{}",
+            TILE_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        if cache_root.exists() {
+            fs::remove_dir_all(&cache_root).expect("remove stale test cache");
+        }
+        let cache = TileCache::new(cache_root.clone(), 4);
+        let mut planned = planned_tile_at(0, 0);
+        planned.chunk_positions = Some(Arc::<[ChunkPos]>::from(vec![ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        }]));
+        let key = tile_cache_key_for_test(&planned);
+        let validation_value = tile_cache_validation_value(
+            &key,
+            &planned.region,
+            planned.chunk_positions.as_deref().expect("chunk positions"),
+            31,
+        );
+        let rgba = vec![
+            255;
+            fast_rgba_byte_len(planned.job.tile_size, planned.job.tile_size)
+                .expect("tile byte length")
+        ];
+        let encoded = encode_fast_rgba_zstd_with_validation(
+            &rgba,
+            planned.job.tile_size,
+            planned.job.tile_size,
+            validation_value,
+        )
+        .expect("encode first tile");
+        cache
+            .write_fast_rgba_zstd_entry(
+                &key,
+                &encoded,
+                Some(planned.region),
+                planned.chunk_positions.as_deref(),
+                31,
+            )
+            .expect("write first authority cache");
+
+        let authority_key = tile_authority_cache_key_from_tile_key(&key);
+        let tiles_path = cache
+            .authority
+            .root_for_key(&authority_key)
+            .join("tiles.0000000000000001.bin");
+        fs::write(&tiles_path, b"corrupt tiles").expect("corrupt authority tiles index");
+        assert!(cache.authority.load_index(&authority_key).is_err());
+
+        let mut rebuilt = planned_tile_at(1, 0);
+        rebuilt.chunk_positions = planned.chunk_positions.clone();
+        let rebuilt_key = tile_cache_key_for_test(&rebuilt);
+        let rebuilt_validation_value = tile_cache_validation_value(
+            &rebuilt_key,
+            &rebuilt.region,
+            rebuilt.chunk_positions.as_deref().expect("chunk positions"),
+            31,
+        );
+        let encoded = encode_fast_rgba_zstd_with_validation(
+            &rgba,
+            rebuilt.job.tile_size,
+            rebuilt.job.tile_size,
+            rebuilt_validation_value,
+        )
+        .expect("encode rebuilt tile");
+        cache
+            .write_fast_rgba_zstd_entry(
+                &rebuilt_key,
+                &encoded,
+                Some(rebuilt.region),
+                rebuilt.chunk_positions.as_deref(),
+                31,
+            )
+            .expect("rebuild authority cache after corrupt index");
+
+        let snapshot = cache
+            .authority
+            .load_index(&authority_key)
+            .expect("load rebuilt authority index")
+            .expect("rebuilt authority index exists");
+        assert_eq!(snapshot.tiles.len(), 1);
+        assert_eq!((snapshot.tiles[0].tile_x, snapshot.tiles[0].tile_z), (1, 0));
+        fs::remove_dir_all(cache_root).ok();
+    }
+
+    #[test]
+    fn prepared_authority_commits_are_batched_into_one_generation() {
+        let cache_root = std::env::temp_dir().join(format!(
+            "bedrock-render-authority-prepared-batch-{}",
+            TILE_CACHE_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        if cache_root.exists() {
+            fs::remove_dir_all(&cache_root).expect("remove stale test cache");
+        }
+        let cache = TileCache::new(cache_root.clone(), 4);
+        let mut first = planned_tile_at(0, 0);
+        let mut second = planned_tile_at(1, 0);
+        let chunk_positions = Arc::<[ChunkPos]>::from(vec![ChunkPos {
+            x: 0,
+            z: 0,
+            dimension: Dimension::Overworld,
+        }]);
+        first.chunk_positions = Some(Arc::clone(&chunk_positions));
+        second.chunk_positions = Some(chunk_positions);
+        let first_key = tile_cache_key_for_test(&first);
+        let second_key = tile_cache_key_for_test(&second);
+        let rgba = vec![
+            64;
+            fast_rgba_byte_len(first.job.tile_size, first.job.tile_size)
+                .expect("tile byte length")
+        ];
+        let first_validation = tile_cache_validation_value(
+            &first_key,
+            &first.region,
+            first.chunk_positions.as_deref().expect("first chunks"),
+            37,
+        );
+        let second_validation = tile_cache_validation_value(
+            &second_key,
+            &second.region,
+            second.chunk_positions.as_deref().expect("second chunks"),
+            37,
+        );
+        let first_encoded = encode_fast_rgba_zstd_with_validation(
+            &rgba,
+            first.job.tile_size,
+            first.job.tile_size,
+            first_validation,
+        )
+        .expect("encode first tile");
+        let second_encoded = encode_fast_rgba_zstd_with_validation(
+            &rgba,
+            second.job.tile_size,
+            second.job.tile_size,
+            second_validation,
+        )
+        .expect("encode second tile");
+        let commits = vec![
+            prepare_fast_rgba_zstd_commit(
+                &first_key,
+                &first_encoded,
+                Some(first.region),
+                first.chunk_positions.as_deref(),
+                37,
+            )
+            .expect("prepare first commit"),
+            prepare_fast_rgba_zstd_commit(
+                &second_key,
+                &second_encoded,
+                Some(second.region),
+                second.chunk_positions.as_deref(),
+                37,
+            )
+            .expect("prepare second commit"),
+        ];
+
+        let committed = cache
+            .commit_prepared_tile_cache_commits(commits)
+            .expect("commit prepared batch");
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].1.generation, 1);
+        assert_eq!(committed[0].1.tiles.len(), 2);
+        let authority_key = tile_authority_cache_key_from_tile_key(&first_key);
+        let loaded = cache
+            .authority
+            .load_index(&authority_key)
+            .expect("load authority index")
+            .expect("authority index exists");
+        assert_eq!(loaded.generation, 1);
+        assert_eq!(loaded.tiles.len(), 2);
         fs::remove_dir_all(cache_root).ok();
     }
 
@@ -18322,7 +19264,7 @@ mod tests {
             job,
             region: ChunkRegion::new(Dimension::Overworld, 0, 0, 0, 0),
             layout,
-            chunk_positions: Some(vec![chunk_pos]),
+            chunk_positions: Some(Arc::<[ChunkPos]>::from(vec![chunk_pos])),
         };
         let cache_key = TileCacheKey {
             world_id: config.world_id,
@@ -18355,18 +19297,6 @@ mod tests {
         );
         assert!(!refresh_events.iter().any(|event| *event == "cached"));
         assert!(refresh_events.iter().any(|event| *event == "rendered"));
-        let refreshed = fs::read(TileCache::new(&cache_root, 1).path_for_key(&cache_key))
-            .expect("read refreshed cache");
-        let header = decode_fast_rgba_zstd_header(&refreshed).expect("decode refreshed header");
-        assert_eq!(
-            header.validation_value,
-            Some(tile_cache_validation_value(
-                &cache_key,
-                &planned.region,
-                planned.chunk_positions.as_deref().expect("chunk positions"),
-                99
-            ))
-        );
 
         fs::remove_dir_all(&cache_root).expect("remove test cache");
     }
@@ -18485,16 +19415,12 @@ mod tests {
                         let kind = match event {
                             TileStreamEvent::Ready { source, .. } => match source {
                                 TileReadySource::MemoryCache => "memory",
-                                TileReadySource::DiskCacheOptimistic => "optimistic",
                                 TileReadySource::DiskCacheFresh => "cached",
                                 TileReadySource::DiskCacheStale => "stale",
                                 TileReadySource::Render => "rendered",
                                 TileReadySource::Preview => "preview",
                             },
-                            TileStreamEvent::CacheValidation { outcome, .. } => match outcome {
-                                TileCacheValidationOutcome::Valid => "cache-valid",
-                                TileCacheValidationOutcome::Mismatch => "cache-mismatch",
-                            },
+                            TileStreamEvent::Empty { .. } => "empty",
                             TileStreamEvent::Failed { .. } => "failed",
                             TileStreamEvent::Complete { .. } => "complete",
                             TileStreamEvent::Progress(_) => "progress",
@@ -18593,11 +19519,14 @@ mod tests {
     fn gpu_compose_requires_batch_large_enough() {
         let mut options = RenderOptions::max_speed_interactive();
         options.backend = RenderBackend::Wgpu;
-        options.gpu.batch_pixels = 256 * 256 * 4;
+        options.gpu.batch_pixels = 0;
 
         assert!(!should_process_tile_on_gpu(&options, 256, 1));
         assert!(!should_process_tile_on_gpu(&options, 256, 3));
         assert!(should_process_tile_on_gpu(&options, 256, 4));
+
+        options.gpu.batch_pixels = 256 * 256;
+        assert!(should_process_tile_on_gpu(&options, 256, 1));
 
         options.backend = RenderBackend::Cpu;
         assert!(!should_process_tile_on_gpu(&options, 256, 8));
